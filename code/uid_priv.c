@@ -1,155 +1,175 @@
-#include <linux/module.h>
 #include <linux/kernel.h>
-#include <linux/version.h>
-#include <linux/proc_fs.h>
+#include <linux/module.h>
+#include <linux/kprobes.h>
+#include <linux/slab.h>
+#include <linux/list.h>
+#include <linux/mutex.h>
 #include <linux/sched.h>
 #include <linux/cred.h>
+#include <linux/uidgid.h>
 #include <linux/capability.h>
-#include <linux/uaccess.h>
-#include <linux/slab.h>
-#include <linux/mutex.h>
 #include "uid_priv.h"
 
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Custom Root Manager - Permission Management Core");
+/* ================= 白名单管理（对应 KernelSU allowlist） ================= */
 
-#define MAX_ALLOWED_UIDS 1024
-static unsigned int allowed_uids[MAX_ALLOWED_UIDS];
-static int allowed_count = 0;
-static DEFINE_MUTEX(allowlist_lock);
+struct uid_rule {
+    uid_t uid;
+    struct list_head list;
+};
 
-static void escalate_privileges(void)
+static LIST_HEAD(rule_list);
+static DEFINE_MUTEX(rule_lock);
+
+static bool uid_allowed(uid_t uid)
+{
+    struct uid_rule *r;
+    bool found = false;
+
+    mutex_lock(&rule_lock);
+    list_for_each_entry(r, &rule_list, list) {
+        if (r->uid == uid) { found = true; break; }
+    }
+    mutex_unlock(&rule_lock);
+    return found;
+}
+
+static int uid_add(uid_t uid)
+{
+    struct uid_rule *r;
+
+    if (uid_allowed(uid)) return 0;
+
+    r = kzalloc(sizeof(*r), GFP_KERNEL);
+    if (!r) return -ENOMEM;
+    r->uid = uid;
+
+    mutex_lock(&rule_lock);
+    list_add_tail(&r->list, &rule_list);
+    mutex_unlock(&rule_lock);
+
+    pr_info("uid_priv: add uid %u\n", uid);
+    return 0;
+}
+
+static int uid_remove(uid_t uid)
+{
+    struct uid_rule *r, *t;
+
+    mutex_lock(&rule_lock);
+    list_for_each_entry_safe(r, t, &rule_list, list) {
+        if (r->uid == uid) {
+            list_del(&r->list);
+            kfree(r);
+            mutex_unlock(&rule_lock);
+            pr_info("uid_priv: remove uid %u\n", uid);
+            return 0;
+        }
+    }
+    mutex_unlock(&rule_lock);
+    return -ENOENT;
+}
+
+/* ================= 核心：把当前进程提权为 root ================= */
+
+static void grant_root(void)
 {
     struct cred *new;
 
     new = prepare_creds();
     if (!new) {
-        printk(KERN_ERR "uid_priv: prepare_creds failed\n");
+        pr_err("uid_priv: prepare_creds failed\n");
         return;
     }
 
-    new->uid = GLOBAL_ROOT_UID;
-    new->euid = GLOBAL_ROOT_UID;
-    new->suid = GLOBAL_ROOT_UID;
-    new->fsuid = GLOBAL_ROOT_UID;
-    new->gid = GLOBAL_ROOT_GID;
-    new->egid = GLOBAL_ROOT_GID;
-    new->sgid = GLOBAL_ROOT_GID;
-    new->fsgid = GLOBAL_ROOT_GID;
+    new->uid.val  = new->euid.val  = new->suid.val  = new->fsuid.val  = 0;
+    new->gid.val  = new->egid.val  = new->sgid.val  = new->fsgid.val  = 0;
 
-    new->cap_effective = CAP_FULL_SET;
-    new->cap_inheritable = CAP_EMPTY_SET;
-    new->cap_permitted = CAP_FULL_SET;
-    new->cap_bset = CAP_FULL_SET;
-    new->cap_ambient = CAP_EMPTY_SET;
+    new->cap_effective   = CAP_FULL_SET;
+    new->cap_permitted   = CAP_FULL_SET;
+    new->cap_inheritable = CAP_FULL_SET;
+    new->cap_bset        = CAP_FULL_SET;
+    new->cap_ambient     = CAP_FULL_SET;
 
     commit_creds(new);
-    printk(KERN_INFO "uid_priv: Privileges escalated to root!\n");
+    pr_info("uid_priv: granted root to pid %d\n", current->pid);
 }
 
-static bool is_uid_allowed(uid_t uid)
+/* ================= 用户态入口：hook __arm64_sys_prctl ================= */
+
+static struct kprobe kp_prctl;
+
+static int prctl_pre(struct kprobe *p, struct pt_regs *regs)
 {
-    int i;
-    bool allowed = false;
+    unsigned long option = regs->regs[0];
+    unsigned long cmd    = regs->regs[1];
+    unsigned long arg    = regs->regs[2];
 
-    mutex_lock(&allowlist_lock);
-    for (i = 0; i < allowed_count; i++) {
-        if (allowed_uids[i] == uid) {
-            allowed = true;
-            break;
-        }
+    if (option != MYROOT_MAGIC)
+        return 0;
+
+    switch (cmd) {
+    case MYROOT_CMD_ADD:
+        uid_add((uid_t)arg);
+        break;
+
+    case MYROOT_CMD_REMOVE:
+        uid_remove((uid_t)arg);
+        break;
+
+    case MYROOT_CMD_GRANT:
+        /* 关键：谁调用，谁被检查；在白名单里就提权 */
+        if (uid_allowed(current_uid().val))
+            grant_root();
+        break;
+
+    default:
+        break;
     }
-    mutex_unlock(&allowlist_lock);
-    return allowed;
+    return 0;
 }
 
-static ssize_t uid_priv_write(struct file *file,
-                              const char __user *ubuf,
-                              size_t cnt, loff_t *ppos)
+/* ================= 自动提权：hook __arm64_sys_execve ================= */
+
+static struct kprobe kp_execve;
+
+static int execve_pre(struct kprobe *p, struct pt_regs *regs)
 {
-    char buf[UID_PRIV_BUF] = {0};
-    char cmd[32] = {0};
-    unsigned int uid_val;
-
-    if (cnt == 0 || cnt >= UID_PRIV_BUF)
-        return -EINVAL;
-
-    if (copy_from_user(buf, ubuf, cnt))
-        return -EFAULT;
-
-    buf[cnt] = '\0';
-
-    if (sscanf(buf, "%31s %u", cmd, &uid_val) >= 1) {
-        if (strcmp(cmd, "add") == 0) {
-            if (sscanf(buf, "%*s %u", &uid_val) != 1) return -EINVAL;
-            mutex_lock(&allowlist_lock);
-            if (allowed_count < MAX_ALLOWED_UIDS) {
-                int i;
-                bool exists = false;
-                for (i = 0; i < allowed_count; i++) {
-                    if (allowed_uids[i] == uid_val) { exists = true; break; }
-                }
-                if (!exists) {
-                    allowed_uids[allowed_count++] = uid_val;
-                    printk(KERN_INFO "uid_priv: Added UID %u\n", uid_val);
-                }
-            }
-            mutex_unlock(&allowlist_lock);
-        }
-        else if (strcmp(cmd, "del") == 0) {
-            if (sscanf(buf, "%*s %u", &uid_val) != 1) return -EINVAL;
-            mutex_lock(&allowlist_lock);
-            int i;
-            for (i = 0; i < allowed_count; i++) {
-                if (allowed_uids[i] == uid_val) {
-                    allowed_uids[i] = allowed_uids[allowed_count - 1];
-                    allowed_count--;
-                    printk(KERN_INFO "uid_priv: Removed UID %u\n", uid_val);
-                    break;
-                }
-            }
-            mutex_unlock(&allowlist_lock);
-        }
-        else if (strcmp(cmd, "apply") == 0) {
-            uid_t current_uid = current_uid().val;
-            if (is_uid_allowed(current_uid)) {
-                escalate_privileges();
-            } else {
-                printk(KERN_WARNING "uid_priv: UID %u DENIED!\n", current_uid);
-                return -EPERM;
-            }
-        }
-    }
-
-    *ppos += cnt;
-    return cnt;
+    /* 白名单里的 uid 执行任何程序，自动提权 */
+    if (uid_allowed(current_uid().val))
+        grant_root();
+    return 0;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
-static const struct proc_ops uid_priv_fops = {
-    .proc_write = uid_priv_write,
-};
-#else
-static const struct file_operations uid_priv_fops = {
-    .write = uid_priv_write,
-};
-#endif
+/* ================= 初始化/退出 ================= */
 
 int uid_priv_init(void)
 {
-    if (!proc_create(UID_PRIV_NODE, 0222, NULL, &uid_priv_fops)) {
-        printk(KERN_ERR "uid_priv: create proc node failed\n");
-        return -ENOMEM;
+    int ret;
+
+    kp_prctl.symbol_name = "__arm64_sys_prctl";
+    kp_prctl.pre_handler = prctl_pre;
+    ret = register_kprobe(&kp_prctl);
+    if (ret) {
+        pr_err("uid_priv: register prctl kprobe failed: %d\n", ret);
+        return ret;
     }
-    printk(KERN_INFO "uid_priv: loaded, node=/proc/" UID_PRIV_NODE "\n");
+
+    kp_execve.symbol_name = "__arm64_sys_execve";
+    kp_execve.pre_handler = execve_pre;
+    ret = register_kprobe(&kp_execve);
+    if (ret) {
+        pr_err("uid_priv: register execve kprobe failed: %d\n", ret);
+        unregister_kprobe(&kp_prctl);
+        return ret;
+    }
+
+    pr_info("uid_priv: loaded\n");
     return 0;
 }
 
 void uid_priv_exit(void)
 {
-    remove_proc_entry(UID_PRIV_NODE, NULL);
-    printk(KERN_INFO "uid_priv: unloaded\n");
+    unregister_kprobe(&kp_execve);
+    unregister_kprobe(&kp_prctl);
+    pr_info("uid_priv: unloaded\n");
 }
-
-module_init(uid_priv_init);
-module_exit(uid_priv_exit);
