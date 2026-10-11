@@ -1,3 +1,4 @@
+#include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/kprobes.h>
@@ -173,3 +174,6 @@ void uid_priv_exit(void)
     unregister_kprobe(&kp_prctl);
     pr_info("uid_priv: unloaded\n");
 }
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("skzvn");
+MODULE_DESCRIPTION("UID Root Module");
