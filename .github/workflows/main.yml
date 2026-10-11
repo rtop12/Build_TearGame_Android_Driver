@@ -1,126 +1,166 @@
-name: Build Android Kernel Module
+name: Android Kernel Driver Builder
 
 on:
   workflow_dispatch:
     inputs:
       android_version:
-        description: "Android version (12-15)"
+        description: "Android Version (Kernel) (e.g., 14)"
         required: true
-        default: "14"
+      kernel_version:
+        description: "Kernel Version (e.g., 6.1)"
+        required: true
       driver_name:
-        description: "Driver .ko filename"
+        description: "Driver Module Name (e.g., devcfg.ko)"
         required: true
-        default: "devcfg.ko"
-      kernel_branch:
-        description: "Kernel manifest branch"
-        required: false
-        default: "common-android14-6.1"
+      target_arch:
+        description: "Target Architecture (aarch64, x86_64)"
+        required: true
+        default: "aarch64"
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout driver code
+      - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: easimon/maximize-build-space@master
         with:
-          path: driver-src
+          root-reserve-mb: 8192
+          swap-size-mb: 4096
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+
+      - name: Validate driver sources
+        run: |
+          shopt -s nullglob
+
+          files=(./code/*.c ./code/*.h ./code/Makefile)
+
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No driver sources or Makefile found in ./code/"
+            exit 1
+          fi
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo dpkg --add-architecture i386
-          sudo apt-get update
           sudo apt-get install -y \
-            git-core gnupg flex bison build-essential \
-            zip curl zlib1g-dev gcc-multilib g++-multilib \
-            libc6-dev-i386 lib32ncurses-dev \
-            x11proto-core-dev libx11-dev lib32z1-dev \
-            libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
-            python3 python3-pip gawk
+            build-essential \
+            flex \
+            bison \
+            libssl-dev \
+            libelf-dev \
+            bc \
+            python-is-python3 \
+            curl \
+            git
 
-      - name: Fix ncurses compatibility
+      - name: Install repo tool
         run: |
-          sudo ln -sf /usr/lib/x86_64-linux-gnu/libncurses.so.6 /usr/lib/x86_64-linux-gnu/libncurses.so.5
-          sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5
-          sudo ln -sf /usr/lib32/libncurses.so.6 /usr/lib32/libncurses.so.5
-          sudo ln -sf /usr/lib32/libtinfo.so.6 /usr/lib32/libtinfo.so.5
+          curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          chmod a+x /usr/local/bin/repo
 
-      - name: Setup repo
+      - name: Sync Android kernel source
         run: |
-          mkdir -p ~/bin
-          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
-          chmod a+x ~/bin/repo
-          echo "$HOME/bin" >> $GITHUB_PATH
-
-      - name: Init kernel source
-        run: |
-          mkdir android-kernel && cd android-kernel
-          repo init -u https://android.googlesource.com/kernel/manifest \
-            -b "${{ github.event.inputs.kernel_branch }}" --depth=1
-          repo sync -c -j$(nproc)
-
-      - name: Copy driver into kernel tree
-        run: |
-          DRIVER_BASENAME=$(basename "${{ github.event.inputs.driver_name }}" .ko)
+          mkdir -p android-kernel
           cd android-kernel
-          mkdir -p common/drivers/kerneldriver
-          cp -r ../driver-src/code/* common/drivers/kerneldriver/
 
-      - name: Remove kerneldriver from drivers/Makefile
+          repo init \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }} \
+            --depth=1
+
+          repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
+
+      - name: Prepare kernel build tree
         run: |
           cd android-kernel
-          sed -i '/obj-y.*+=.*kerneldriver/d' common/drivers/Makefile
-          sed -i '/obj-m.*+=.*kerneldriver/d' common/drivers/Makefile
 
-      - name: Add module to GKI modules list
-        if: ${{ github.event.inputs.android_version > 13 }}
-        run: |
-          cd android-kernel
-          DRIVER_BASENAME=$(basename "${{ github.event.inputs.driver_name }}" .ko)
-          MODULE_PATH="drivers/kerneldriver/${DRIVER_BASENAME}.ko"
-
-          awk -i inplace -v module="$MODULE_PATH" '
-            BEGIN { added=0 }
-            /_COMMON_GKI_MODULES_LIST = \[/ { in_list=1 }
-            in_list && /\]/ {
-              if (!added) {
-                print "    \"" module "\","
-                added=1
-              }
-              in_list=0
-            }
-            in_list && !added {
-              if (module < $0) {
-                print "    \"" module "\","
-                added=1
-              }
-            }
-            { print }
-          ' common/modules.bzl
-
-      - name: Build kernel
-        run: |
-          cd android-kernel
-          DIST_DIR=$(pwd)/out/dist
-          mkdir -p "$DIST_DIR"
-
-          ANDROID_VER="${{ github.event.inputs.android_version }}"
-
-          if [ "$ANDROID_VER" -le 12 ]; then
-            BUILD_CONFIG=common/build.config.gki.aarch64 \
-              LTO=thin build/build.sh -j$(nproc)
-          elif [ "$ANDROID_VER" -le 13 ]; then
-            BUILD_CONFIG=common/build.config.gki.aarch64 \
-              LTO=thin build/build.sh -j$(nproc)
+          if [ "${{ fromJSON(github.event.inputs.android_version) }}" -ge 14 ]; then
+            tools/bazel build //common:kernel_${{ github.event.inputs.target_arch }}_headers
           else
-            tools/bazel run //common:kernel_aarch64_dist -- \
-              --dist_dir="$DIST_DIR" -j$(nproc)
+            BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} \
+              LTO=thin \
+              build/build.sh prepare
           fi
 
-          echo "DIST_DIR=$DIST_DIR" >> $GITHUB_ENV
+      - name: Prepare out-of-tree driver build
+        run: |
+          DRIVER_NAME="${{ github.event.inputs.driver_name }}"
+          KO_BASE="${DRIVER_NAME%.ko}"
+          ARCH_MAP_aarch64="arm64"
+          ARCH_MAP_x86_64="x86"
+          KERNEL_ARCH="${ARCH_MAP_${{ github.event.inputs.target_arch }}:-${{ github.event.inputs.target_arch }}}"
+
+          KERNEL_DIR="$(pwd)/android-kernel"
+
+          if [ "${{ fromJSON(github.event.inputs.android_version) }}" -ge 14 ]; then
+            KERNEL_OUT="$(find "$KERNEL_DIR/out" -maxdepth 3 -type d -name 'kernel_*_headers' | head -n1)"
+          else
+            KERNEL_OUT="$(find "$KERNEL_DIR/out" -maxdepth 3 -type d -name 'android*' | head -n1)"
+          fi
+
+          if [ -z "$KERNEL_OUT" ]; then
+            echo "Kernel build/output directory not found"
+            exit 1
+          fi
+
+          mkdir -p driver-build
+
+          cp ./code/* driver-build/
+
+          cat > driver-build/Makefile <<'MAKE'
+          ifeq ($(KERNEL_DIR),)
+          $(error KERNEL_DIR is not set)
+          endif
+
+          ifeq ($(KERNEL_OUT),)
+          $(error KERNEL_OUT is not set)
+          endif
+
+          ifeq ($(DRIVER_NAME),)
+          $(error DRIVER_NAME is not set)
+          endif
+
+          obj-m := $(DRIVER_NAME:.ko=.o)
+
+          all:
+          	$(MAKE) -C $(KERNEL_DIR) O=$(KERNEL_OUT) ARCH=$(KERNEL_ARCH) M=$(CURDIR) modules
+
+          clean:
+          	$(MAKE) -C $(KERNEL_DIR) O=$(KERNEL_OUT) ARCH=$(KERNEL_ARCH) M=$(CURDIR) clean
+          MAKE
+
+          echo "KERNEL_DIR=$KERNEL_DIR" >> "$GITHUB_ENV"
+          echo "KERNEL_OUT=$KERNEL_OUT" >> "$GITHUB_ENV"
+          echo "KERNEL_ARCH=$KERNEL_ARCH" >> "$GITHUB_ENV"
+          echo "KO_BASE=$KO_BASE" >> "$GITHUB_ENV"
+
+      - name: Build driver module
+        run: |
+          cd driver-build
+
+          make \
+            KERNEL_DIR="$KERNEL_DIR" \
+            KERNEL_OUT="$KERNEL_OUT" \
+            KERNEL_ARCH="$KERNEL_ARCH" \
+            DRIVER_NAME="${{ github.event.inputs.driver_name }}" \
+            -j$(nproc)
+
+          if [ ! -f "${{ github.event.inputs.driver_name }}" ]; then
+            echo "Build completed but ${{ github.event.inputs.driver_name }} was not generated"
+            find . -type f -name "*.ko" || true
+            exit 1
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-output
-          path: ${{ env.DIST_DIR }}
+          name: kernel-driver-${{ github.event.inputs.target_arch }}
+          path: driver-build/${{ github.event.inputs.driver_name }}
