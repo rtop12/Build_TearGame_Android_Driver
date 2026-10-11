@@ -1,10 +1,7 @@
-obj-m += devcfg.o
-
-KDIR ?= /lib/modules/$(shell uname -r)/build
-PWD  := $(shell pwd)
+obj-m := devcfg.o
 
 all:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	$(MAKE) -C $(KERNEL_DIR) O=$(KERNEL_OUT) ARCH=$(KERNEL_ARCH) M=$(CURDIR) modules
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	$(MAKE) -C $(KERNEL_DIR) O=$(KERNEL_OUT) ARCH=$(KERNEL_ARCH) M=$(CURDIR) clean
