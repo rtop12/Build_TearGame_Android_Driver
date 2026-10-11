@@ -1,0 +1,15 @@
+load("//common:build/kernel/defs.bzl", "kernel_module")
+
+package(default_visibility = ["//visibility:public"])
+
+kernel_module(
+    name = "devcfg",
+    srcs = [
+        "devcfg.c",
+    ],
+    hdrs = [
+        "devcfg.h",
+    ],
+    kernel_build = "//common:kernel_aarch64",
+    module_name = "devcfg",
+)
