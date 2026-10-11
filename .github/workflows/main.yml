@@ -19,7 +19,6 @@ on:
 
 jobs:
   build:
-    # 固定使用 ubuntu-22.04，避免最新版系统环境变量差异导致构建失败
     runs-on: ubuntu-22.04
     
     steps:
@@ -92,11 +91,14 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3
+          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3 wget
           
-      # ============== 新增：安装并强制使用 Clang 17 ==============
-      - name: Install and force Clang 17
+      # ============== 核心修复：通过 LLVM 官方脚本安装 Clang 17 ==============
+      - name: Install Clang 17 via LLVM official script
         run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 17
           sudo apt-get install -y clang-17 lld-17
           
       - name: Fix missing kprobe symbols for Android 13
@@ -109,20 +111,21 @@ jobs:
           done
           sed -i '/EXPORT_SYMBOL(unregister_kprobe);/a EXPORT_SYMBOL(register_kprobe);' common/kernel/kprobes.c
           
-      # ============== 修改：构建步骤，替换预编译的 Clang 为系统 Clang 17 ==============
+      # ============== 修改：构建步骤，劫持预编译的 Clang 为系统 Clang 17 ==============
       - name: Build kernel module
         run: |
           cd android-kernel
           
-          # 劫持内核源码自带的 clang-stable 目录，将其替换为系统的 Clang 17
-          # 这样无论 build.sh 还是 Bazel 都会自动使用高版本 Clang
-          if [ -d "prebuilts/clang/host/linux-x86/clang-stable" ]; then
-            sudo rm -rf prebuilts/clang/host/linux-x86/clang-stable
-          fi
+          # 清理原有的 clang-stable 链接，将其指向我们刚刚通过 LLVM 源安装的 Clang 17
+          # 注意：llvm.sh 安装的二进制文件位于 /usr/lib/llvm-17/bin/ 下
+          sudo rm -rf prebuilts/clang/host/linux-x86/clang-stable
           sudo mkdir -p prebuilts/clang/host/linux-x86/clang-stable/bin
-          sudo ln -s /usr/bin/clang-17 prebuilts/clang/host/linux-x86/clang-stable/bin/clang
-          sudo ln -s /usr/bin/clang++-17 prebuilts/clang/host/linux-x86/clang-stable/bin/clang++
-          sudo ln -s /usr/bin/ld.lld-17 prebuilts/clang/host/linux-x86/clang-stable/bin/ld.lld
+          sudo ln -sf /usr/lib/llvm-17/bin/clang prebuilts/clang/host/linux-x86/clang-stable/bin/clang
+          sudo ln -sf /usr/lib/llvm-17/bin/clang++ prebuilts/clang/host/linux-x86/clang-stable/bin/clang++
+          sudo ln -sf /usr/lib/llvm-17/bin/ld.lld prebuilts/clang/host/linux-x86/clang-stable/bin/ld.lld
+          
+          # 导出环境变量，确保部分构建脚本能识别系统 Clang 17
+          export PATH="/usr/lib/llvm-17/bin:$PATH"
 
           if [ ${{ github.event.inputs.android_version }} -le 13 ]; then
             BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} LTO=thin build/build.sh -j32
@@ -135,7 +138,7 @@ jobs:
           echo "OUTPUT_PATH=$OUTPUT_PATH" >> $GITHUB_ENV
         continue-on-error: true
       
-      # ============== 新增：提取单独的 .ko 文件 ==============
+      # ============== 收集单独的 .ko 文件 ==============
       - name: Collect .ko files
         run: |
           mkdir -p ko_output
@@ -148,7 +151,7 @@ jobs:
           echo "提取到的 .ko 文件列表："
           ls -lh ko_output/ || echo "未找到 .ko 文件，请检查构建日志"
 
-      # ============== 修改：只上传提取出的 ko 文件 ==============
+      # ============== 只上传提取出的 ko 文件 ==============
       - name: Upload artifacts
         uses: actions/upload-artifact@v4.6.2
         with:
