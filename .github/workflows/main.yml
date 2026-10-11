@@ -12,8 +12,9 @@ on:
         required: true
         default: '6.1'
       driver_name:
-        description: 'Driver Module Name (e.g., mydriver.ko)'
+        description: 'Driver Module Name (e.g., uid_priv.ko)'
         required: true
+        default: 'uid_priv.ko'
       target_arch:
         description: 'Target Architecture (aarch64, x86_64)'
         required: true
@@ -61,72 +62,64 @@ jobs:
             --depth=1
           repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
 
-      - name: Prepare kernel build tree (Generate Headers)
+      - name: Inject Driver & Setup Bazel DDK Rule
+        run: |
+          # 1. 提取模块名称（去掉 .ko 后缀）
+          MOD_NAME="${{ github.event.inputs.driver_name }}"
+          MOD_NAME="${MOD_NAME%.ko}"
+
+          # 2. 在内核源码树中创建专属驱动目录
+          DRIVER_DIR="android-kernel/common/drivers/my_modules"
+          mkdir -p "$DRIVER_DIR"
+
+          # 3. 拷贝源码文件（.c 和 .h）
+          cp ./code/*.c ./code/*.h "$DRIVER_DIR/" 2>/dev/null || true
+
+          # 4. 【关键】动态生成 Bazel 编译规则 (BUILD.bazel)
+          cat > "$DRIVER_DIR/BUILD.bazel" <<EOF
+          package(default_visibility = ["//visibility:public"])
+
+          load("@build_kernel//:build_defs.bzl", "kernel_module")
+
+          kernel_module(
+              name = "${MOD_NAME}",
+              srcs = ["${MOD_NAME}.c"],
+              hdrs = glob(["*.h"]),
+          )
+          EOF
+
+          echo "=== Generated BUILD.bazel ==="
+          cat "$DRIVER_DIR/BUILD.bazel"
+
+      - name: Build .ko Module via Bazel
         run: |
           cd android-kernel
-          if [ "${{ fromJSON(github.event.inputs.android_version) }}" -ge 14 ]; then
-            echo "Building headers with Bazel..."
-            tools/bazel build //common:kernel_${{ github.event.inputs.target_arch }}_headers
-          else
-            echo "Preparing build tree with build.sh..."
-            BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} \
-            build/build.sh prepare
-          fi
+          MOD_NAME="${{ github.event.inputs.driver_name }}"
+          MOD_NAME="${MOD_NAME%.ko}"
 
-      - name: Build Driver Module (Out-of-Tree)
+          echo "Building module //common/drivers/my_modules:${MOD_NAME} with Bazel..."
+          # 使用 Bazel 仅编译该特定模块，速度极快，产物为 .ko
+          tools/bazel build //common/drivers/my_modules:${MOD_NAME}
+
+      - name: Extract and Upload .ko Artifact
         run: |
-          KERNEL_ARCH=""
-          if [ "${{ github.event.inputs.target_arch }}" == "aarch64" ]; then
-            KERNEL_ARCH="arm64"
-          elif [ "${{ github.event.inputs.target_arch }}" == "x86_64" ]; then
-            KERNEL_ARCH="x86"
-          else
-            KERNEL_ARCH="${{ github.event.inputs.target_arch }}"
-          fi
-
-          KERNEL_DIR="$(pwd)/android-kernel"
-          KERNEL_OUT=""
-
-          if [ "${{ fromJSON(github.event.inputs.android_version) }}" -ge 14 ]; then
-            KERNEL_OUT=$(find "$KERNEL_DIR/out" -type d -name "kernel_${{ github.event.inputs.target_arch }}*" 2>/dev/null | head -n1)
-          else
-            KERNEL_OUT=$(find "$KERNEL_DIR/out" -type d -name "android*" 2>/dev/null | head -n1)
-          fi
-
-          if [ -z "$KERNEL_OUT" ]; then
-            echo "::error::Cannot find kernel headers output directory."
-            find "$KERNEL_DIR/out" -type d 2>/dev/null | head -20
+          MOD_NAME="${{ github.event.inputs.driver_name }}"
+          # 动态在 bazel 庞大的输出目录中定位刚刚编译出的 .ko 文件
+          KO_FILE=$(find android-kernel/out -name "${MOD_NAME}" -type f 2>/dev/null | head -n1)
+          
+          if [ -z "$KO_FILE" ]; then
+            echo "::error::Failed to find compiled .ko file in Bazel out directory."
+            find android-kernel/out -name "*.ko" 2>/dev/null | head -10
             exit 1
           fi
 
-          echo "Kernel Source: $KERNEL_DIR"
-          echo "Kernel Out:    $KERNEL_OUT"
-          echo "Kernel Arch:   $KERNEL_ARCH"
-
-          mkdir -p driver-build
-          cp ./code/* driver-build/
-
-          KO_NAME="${{ github.event.inputs.driver_name }}"
-          MOD_NAME="${KO_NAME%.ko}"
-
-          cat > driver-build/Makefile <<EOF
-          obj-m += ${MOD_NAME}.o
-
-          all:
-          	\$(MAKE) -C ${KERNEL_DIR} O=${KERNEL_OUT} ARCH=${KERNEL_ARCH} M=\$(CURDIR) modules
-
-          clean:
-          	\$(MAKE) -C ${KERNEL_DIR} O=${KERNEL_OUT} ARCH=${KERNEL_ARCH} M=\$(CURDIR) clean
-          EOF
-
-          echo "=== Generated Makefile ==="
-          cat driver-build/Makefile
-
-          make -C driver-build -j$(nproc)
+          echo "Found compiled module at: $KO_FILE"
+          mkdir -p final-artifact
+          cp "$KO_FILE" "final-artifact/${MOD_NAME}"
 
       - name: Upload .ko Artifact
         uses: actions/upload-artifact@v4
         with:
           name: kernel-driver-${{ github.event.inputs.target_arch }}
-          path: driver-build/${{ github.event.inputs.driver_name }}
+          path: final-artifact/${{ github.event.inputs.driver_name }}
           if-no-files-found: error
