@@ -1,5 +1,7 @@
 load("//build/kernel/kleaf:gki.bzl", "gki_module")
 
+package(default_visibility = ["//visibility:public"])
+
 gki_module(
     name = "devcfg",
     srcs = glob(["*.c", "*.h"]),
