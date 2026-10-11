@@ -45,7 +45,7 @@ jobs:
 
       - name: Install Google repo tool
         run: |
-          curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          curl -L https://storage.googleapis.com/git-repo-内部工具s/repo -o /usr/local/bin/repo
           chmod a+x /usr/local/bin/repo
 
       - name: Sync Android kernel source
@@ -56,93 +56,83 @@ jobs:
             --depth=1
           repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
 
-      - name: Generate headers via Bazel (official way for android14-6.1)
+      - name: Build full GKI kernel via Bazel (gives complete out_dir + Module.symvers)
         run: |
           cd android-kernel
-          echo "Building headers with Bazel..."
-          tools/bazel build //common:kernel_${{ github.event.inputs.target_arch }}_headers
-          echo "Bazel build done. Searching for .config and headers..."
+          tools/bazel build //common:kernel_${{ github.event.inputs.target_arch }}
+          echo "Bazel full-kernel build done."
 
-          # 全局搜索 .config 文件
-          CONFIG_FILE=$(find "$(pwd)/out" -name ".config" -type f 2>/dev/null | head -n1)
-          if [ -z "$CONFIG_FILE" ]; then
-            echo "::error::Cannot find .config in Bazel output."
-            find "$(pwd)/out" -maxdepth 4 -type f -name "*.config" 2>/dev/null | head -5
+      - name: Locate complete out_dir and matching clang
+        run: |
+          cd android-kernel
+
+          # 1. 真正可外编的 out_dir = 含 Module.symvers 的目录
+          SYMVER=$(find out/bazel -type f -name "Module.symvers" -path "*out_dir*" 2>/dev/null | head -n1)
+          if [ -z "$SYMVER" ]; then
+            echo "::error::No Module.symvers found in Bazel out_dir. Kernel build may have failed."
+            find out/bazel -type f -name "Module.symvers" 2>/dev/null | head
             exit 1
           fi
-          echo "Found .config at: $CONFIG_FILE"
+          KERNEL_OUT=$(dirname "$SYMVER")
+          echo "KERNEL_OUT=$PWD/$KERNEL_OUT" >> $GITHUB_ENV
 
-          # .config 所在的目录就是内核构建输出目录
-          KERNEL_OUT_DIR=$(dirname "$CONFIG_FILE")
-          echo "Kernel output directory: $KERNEL_OUT_DIR"
-
-          # 验证头文件是否存在
-          if [ ! -f "$KERNEL_OUT_DIR/include/generated/autoconf.h" ] && \
-             [ ! -f "$KERNEL_OUT_DIR/include/config/auto.conf" ]; then
-            echo "::warning::autoconf.h not found in expected location, but .config exists."
+          # 2. 锁定与内核同版本(r487747c)的 clang，避免回退到系统 clang14
+          CLANG_DIR=$(find prebuilts/clang/host/linux-x86 -maxdepth 1 -type d -name "*487747*" 2>/dev/null | head -n1)
+          if [ -z "$CLANG_DIR" ]; then
+            CLANG_DIR=$(find prebuilts/clang/host/linux-x86 -maxdepth 1 -type d -name "clang-r*" 2>/dev/null | sort | tail -n1)
           fi
+          if [ -z "$CLANG_DIR" ]; then
+            echo "::error::Cannot find prebuilt clang toolchain."
+            exit 1
+          fi
+          echo "CLANG_BIN=$CLANG_DIR/bin" >> $GITHUB_ENV
+          echo "Using clang at: $CLANG_DIR/bin"
 
-          echo "KERNEL_OUT_DIR=$KERNEL_OUT_DIR" >> $GITHUB_ENV
-
-      - name: Build Driver Module (Out-of-Tree via make)
+      - name: Build Driver Module (Out-of-Tree with matching clang17)
         run: |
           KERNEL_DIR="$(pwd)/android-kernel/common"
-          KERNEL_OUT="${{ env.KERNEL_OUT_DIR }}"
+          KERNEL_OUT="${{ env.KERNEL_OUT }}"
+          CLANG_BIN="${{ env.CLANG_BIN }}"
 
-          if [ -z "$KERNEL_OUT" ] || [ ! -d "$KERNEL_OUT" ]; then
-            echo "::error::KERNEL_OUT not set or not a directory."
-            exit 1
-          fi
-
-          # 映射架构
           if [ "${{ github.event.inputs.target_arch }}" == "aarch64" ]; then
             KERNEL_ARCH="arm64"
           else
             KERNEL_ARCH="x86"
           fi
 
-          echo "Kernel Source: $KERNEL_DIR"
-          echo "Kernel Out:    $KERNEL_OUT"
-          echo "Kernel Arch:   $KERNEL_ARCH"
+          echo "Kernel Src: $KERNEL_DIR"
+          echo "Kernel Out: $KERNEL_OUT"
+          echo "Kernel Arch:$KERNEL_ARCH"
 
-          # 准备驱动编译目录
           mkdir -p driver-build
           cp ./code/*.c ./code/*.h driver-build/ 2>/dev/null || cp ./code/* driver-build/
 
-          # 生成 Makefile
+          # 模块 Makefile 只声明 obj-m，交叉参数全部走命令行，杜绝版本错配
           KO_NAME="${{ github.event.inputs.driver_name }}"
           MOD_NAME="${KO_NAME%.ko}"
-
-          cat > driver-build/Makefile <<EOF
-          obj-m += ${MOD_NAME}.o
-
-          all:
-          	\$(MAKE) -C ${KERNEL_DIR} O=${KERNEL_OUT} ARCH=${KERNEL_ARCH} M=\$(CURDIR) modules
-
-          clean:
-          	\$(MAKE) -C ${KERNEL_DIR} O=${KERNEL_OUT} ARCH=${KERNEL_ARCH} M=\$(CURDIR) clean
-          EOF
-
+          echo "obj-m += ${MOD_NAME}.o" > driver-build/Makefile
           echo "=== Makefile ==="
           cat driver-build/Makefile
 
-          # 查找 Clang 工具链并加入 PATH
-          CLANG_DIR=$(find "$(pwd)/android-kernel/prebuilts/clang/host/linux-x86" -maxdepth 1 -type d -name "clang-*" 2>/dev/null | head -n1)
-          if [ -n "$CLANG_DIR" ]; then
-            export PATH="$CLANG_DIR/bin:$PATH"
-            echo "Using Clang from: $CLANG_DIR/bin"
-            CLANG_FLAG="LLVM=1 LLVM_IAS=1"
-          else
-            echo "Clang not found, using GCC"
-            CLANG_FLAG=""
-          fi
+          # 【关键】显式强制 CC/LD 用 prebuilts clang17 + LLVM 全套，绝不落到 Ubuntu clang14
+          make -C "$KERNEL_DIR" \
+            O="$KERNEL_OUT" \
+            ARCH=$KERNEL_ARCH \
+            LLVM=1 LLVM_IAS=1 \
+            CC="$CLANG_BIN/clang" \
+            LD="$CLANG_BIN/ld.lld" \
+            NM="$CLANG_BIN/llvm-nm" \
+            OBJCOPY="$CLANG_BIN/llvm-objcopy" \
+            OBJDUMP="$CLANG_BIN/llvm-objdump" \
+            READELF="$CLANG_BIN/llvm-readelf" \
+            STRIP="$CLANG_BIN/llvm-strip" \
+            M="$(pwd)/driver-build" \
+            modules -j$(nproc)
 
-          # 编译模块
-          echo "=== Building module ==="
-          make -C driver-build -j$(nproc) ${CLANG_FLAG}
-
-          echo "=== Generated .ko files ==="
+          echo "=== Generated .ko ==="
           find driver-build -name "*.ko"
+          echo "=== vermagic check ==="
+          modinfo driver-build/${{ github.event.inputs.driver_name }} | grep -i vermagic || true
 
       - name: Upload .ko Artifact
         uses: actions/upload-artifact@v4
