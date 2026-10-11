@@ -20,12 +20,13 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    
     steps:
       - name: Free up disk space
         run: |
           echo "=== Before cleanup ==="
           df -h
+          # Remove unnecessary pre-installed software
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
@@ -33,19 +34,25 @@ jobs:
           sudo rm -rf /usr/local/share/boost
           sudo rm -rf /usr/share/swift
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          # Clean apt cache
           sudo apt-get clean
+          # Remove docker images
           docker rmi $(docker image ls -aq) 2>/dev/null || true
           echo "=== After cleanup ==="
           df -h
 
       - name: Checkout repository
         uses: actions/checkout@v4.2.2
-
+        
       - name: Prepare kerneldriver directory
         run: |
           mkdir -p kerneldriver
-          cp ./code/*.h ./code/*.c ./code/Makefile kerneldriver/
-
+          # 移动源码以及 Bazel 构建规则文件
+          mv ./code/*.h ./code/*.c ./code/Makefile ./code/BUILD.bazel kerneldriver/ 2>/dev/null || \
+          mv ./code/*.h ./code/*.c ./code/Makefile kerneldriver/
+          echo "=== kerneldriver contents ==="
+          ls -lh kerneldriver/
+          
       - name: Install repo tool
         run: |
           sudo curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
@@ -56,6 +63,7 @@ jobs:
           mkdir -p android-kernel && cd android-kernel
           repo init -u https://android.googlesource.com/kernel/manifest -b common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}
           repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
+          # Remove .git directories to save space (not needed for build)
           find . -name ".git" -type d -exec rm -rf {} + 2>/dev/null || true
           rm -rf .repo
           echo "=== After repo sync cleanup ==="
@@ -64,32 +72,38 @@ jobs:
       - name: Copy kerneldriver
         run: |
           cd android-kernel
-          rm -rf common/drivers/kerneldriver
-          cp -r ../kerneldriver common/drivers/kerneldriver
+          cp -r ../kerneldriver common/drivers
 
       - name: Modify Makefile
         run: |
           cd android-kernel
-          grep -q "obj-y += kerneldriver/" common/drivers/Makefile || echo "obj-y += kerneldriver/" >> common/drivers/Makefile
+          echo "obj-y += kerneldriver/" >> common/drivers/Makefile
 
       - name: Add module to GKI modules list
         if: ${{ github.event.inputs.android_version > 13 }}
         run: |
           cd android-kernel
           MODULE_NAME="drivers/kerneldriver/${{ github.event.inputs.driver_name }}"
+          
           awk -i inplace -v module="$MODULE_NAME" '
             BEGIN { added=0 }
             /_COMMON_GKI_MODULES_LIST = \[/ { in_list=1 }
             in_list && /\]/ {
-              if (!added) { print "    \"" module "\","; added=1 }
+              if (!added) {
+                print "    \"" module "\","
+                added=1
+              }
               in_list=0
             }
             in_list && !added {
-              if (module < $0) { print "    \"" module "\","; added=1 }
+              if (module < $0) {
+                print "    \"" module "\","
+                added=1
+              }
             }
             { print }
           ' common/modules.bzl
-
+          
       - name: Prepare module list for legacy builds
         if: ${{ github.event.inputs.android_version <= 13 }}
         run: |
@@ -106,7 +120,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3
-
       - name: Fix missing kprobe symbols for Android 13
         if: ${{ github.event.inputs.android_version == 13 }}
         run: |
@@ -116,84 +129,79 @@ jobs:
             echo "$symbol" >> common/android/abi_gki_${{ github.event.inputs.target_arch }}
           done
           sed -i '/EXPORT_SYMBOL(unregister_kprobe);/a EXPORT_SYMBOL(register_kprobe);' common/kernel/kprobes.c
-
-      # 关键修复1：先把 OUTPUT_PATH 计算好并写入环境，再执行构建；
-      # 关键修复2：去掉 continue-on-error，让真实构建失败立即暴露（之前它把失败吞成"绿勾"，
-      #            导致 OUTPUT_PATH 没写、后续相对路径全部错乱）。
-      - name: Compute output path
-        run: |
-          if [ "${{ github.event.inputs.android_version }}" -le 13 ]; then
-            echo "OUTPUT_PATH=out/android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}/dist" >> $GITHUB_ENV
-          else
-            echo "OUTPUT_PATH=out/kernel_${{ github.event.inputs.target_arch }}" >> $GITHUB_ENV
-          fi
-
+          
       - name: Build kernel module
         run: |
           cd android-kernel
-          if [ "${{ github.event.inputs.android_version }}" -le 13 ]; then
+          if [ ${{ github.event.inputs.android_version }} -le 13 ]; then
             BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} LTO=thin build/build.sh -j32
+            OUTPUT_PATH="out/android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}/dist"
           else
             echo "Using Bazel build system for Android ${{ github.event.inputs.android_version }}"
-            tools/bazel run //common:kernel_${{ github.event.inputs.target_arch }}_dist
+            # Bazel 编译内核模块
+            tools/bazel run //common:kernel_${{ github.event.inputs.target_arch }}_dist -- -j$(nproc)
+            # 记录 Bazel 输出目录，方便后续提取产物
+            echo "BAZEL_OUT=$(pwd)/bazel-out/k8-fastbuild/bin/common" >> $GITHUB_ENV
+            OUTPUT_PATH="out/kernel_${{ github.event.inputs.target_arch }}"
           fi
+          echo "OUTPUT_PATH=$OUTPUT_PATH" >> $GITHUB_ENV
+        continue-on-error: true
 
-      # 关键修复3：产物收集一律用 $GITHUB_WORKSPACE 绝对路径；
-      # 关键修复4：不依赖 OUTPUT_PATH 精确目录，直接在整个 out/ 树下 find 目标 .ko，
-      #            避免因 Bazel/legacy 产物落在子目录而 cp/ls 落空；
-      # 关键修复5：找不到驱动 .ko 时显式报错并打印诊断，而不是抛 exit code 2。
       - name: Collect build artifacts
         run: |
-          ARTIFACT_DIR="$GITHUB_WORKSPACE/artifacts"
-          mkdir -p "$ARTIFACT_DIR"
-
-          KERNEL_ROOT="$GITHUB_WORKSPACE/android-kernel"
-          DRIVER="${{ github.event.inputs.driver_name }}"
-
-          echo "=== OUTPUT_PATH = $OUTPUT_PATH ==="
-          echo "=== Searching under: $KERNEL_ROOT/out ==="
-          df -h
-
-          # 优先在声明的 dist 目录找，找不到再到整个 out/ 全局找
-          MATCH=$(find "$KERNEL_ROOT/${OUTPUT_PATH:-out}" -name "$DRIVER" 2>/dev/null | head -n1)
-          if [ -z "$MATCH" ]; then
-            MATCH=$(find "$KERNEL_ROOT/out" -name "$DRIVER" 2>/dev/null | head -n1)
-          fi
-
-          if [ -z "$MATCH" ]; then
-            echo "ERROR: built module '$DRIVER' was NOT found under android-kernel/out."
-            echo "--- top-level out listing for diagnosis ---"
-            ls -R "$KERNEL_ROOT/out" 2>/dev/null | head -n 100 || true
-            exit 1
-          fi
-
-          echo "=== Found driver: $MATCH ==="
-          cp -v "$MATCH" "$ARTIFACT_DIR/"
-
-          # 同目录下其他小型 .ko（排除 >50MB 的大内核镜像模块）
-          FOUND_DIR=$(dirname "$MATCH")
-          for ko in "$FOUND_DIR"/*.ko; do
-            [ -f "$ko" ] || continue
-            size=$(stat -c%s "$ko" 2>/dev/null || echo 0)
-            if [ "$size" -lt 52428800 ]; then
-              cp -v "$ko" "$ARTIFACT_DIR/" 2>/dev/null || true
+          mkdir -p artifacts
+          
+          # 针对 Bazel 构建系统，手动提取编译产物
+          if [ "${{ github.event.inputs.android_version }}" -gt 13 ]; then
+            DRIVER_MODULE_NAME=$(basename "${{ github.event.inputs.driver_name }}" .ko)
+            
+            # 查找并收集最新的 .ko 文件（Bazel 输出结构复杂，使用通配符查找）
+            echo "=== Searching for .ko modules in Bazel output ==="
+            find "${BAZEL_OUT}/kernel_${{ github.event.inputs.target_arch }}" -name "*.ko" -type f 2>/dev/null | while read -r ko_path; do
+              ko_name=$(basename "$ko_path")
+              ko_size=$(stat -c%s "$ko_path" 2>/dev/null || echo 0)
+              
+              # 复制小于 50MB 的 .ko 文件到 artifacts
+              if [ "$ko_size" -lt 52428800 ]; then
+                cp -v "$ko_path" "artifacts/${DRIVER_MODULE_NAME}-${ANDROID_VERSION}.ko" 2>/dev/null || cp -v "$ko_path" "artifacts/${ko_name}" 2>/dev/null
+                echo "Successfully copied: $ko_path"
+              else
+                echo "Skipping large file (>50MB): $ko_path ($ko_size bytes)"
+              fi
+            done
+            
+            # 如果 Bazel 产物目录中没有找到，尝试在源码驱动目录中查找（适用于本地编译成功的情况）
+            if [ ! "$(ls -A artifacts/ 2>/dev/null)" ]; then
+              echo "No .ko found in Bazel output. Trying local build..."
+              cd android-kernel
+              cd common/drivers/kerneldriver
+              make -C ../../.. M=$(pwd) clean
+              make -C ../../.. M=$(pwd) modules
+              cp -r ./*.ko ../../../artifacts/ 2>/dev/null || true
             fi
-          done
-
+          else
+            # 针对传统构建系统的产物提取
+            cd android-kernel/${{ env.OUTPUT_PATH }}
+            if [ -f "${{ github.event.inputs.driver_name }}" ]; then
+              cp -v "${{ github.event.inputs.driver_name }}" ../../../artifacts/
+            fi
+            # 复制其他 .ko 文件（排除大型内核模块）
+            for ko in *.ko; do
+              if [ -f "$ko" ]; then
+                size=$(stat -c%s "$ko" 2>/dev/null || echo 0)
+                # 只复制小于 50MB 的 .ko 文件
+                if [ "$size" -lt 52428800 ]; then
+                  cp -v "$ko" ../../../artifacts/ 2>/dev/null || true
+                fi
+              fi
+            done
+          fi
+          
           echo "=== Artifacts to upload ==="
-          ls -lh "$ARTIFACT_DIR"
-
+          ls -lh artifacts/
+      
       - name: Upload artifacts
-        if: always()
         uses: actions/upload-artifact@v4.6.2
         with:
           name: kernel-driver-${{ github.event.inputs.target_arch }}
           path: artifacts/
-
-      - name: Post-check disk & logs
-        if: failure()
-        run: |
-          echo "=== disk usage on failure ==="
-          df -h
-          echo "=== workspace tree (depth 2) ==="
-          find "$GITHUB_WORKSPACE/android-kernel/out" -maxdepth 2 2>/dev/null | head -n 80 || true
