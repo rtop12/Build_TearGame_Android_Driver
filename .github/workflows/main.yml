@@ -26,22 +26,26 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Maximize Build Space
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 1024
-          swap-size-mb: 8192
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
-          remove-docker-images: 'true'
-          swap-reclaim-mb: 8192
+      - name: Free disk space manually
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/chromium
+          sudo rm -rf /usr/local/lib/android/sdk
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/.ghcup
+          sudo docker rmi $(docker images -aq) 2>/dev/null || true
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+          sudo rm -rf /var/cache/apt/archives/*
+          df -h
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential flex bison libssl-dev libelf-dev bc python3-pip curl
+          sudo apt-get install -y --no-install-recommends build-essential flex bison libssl-dev libelf-dev bc curl
 
       - name: Install Google repo tool
         run: |
@@ -71,7 +75,6 @@ jobs:
 
       - name: Build Driver Module (Out-of-Tree)
         run: |
-          # 1. 映射架构名称
           KERNEL_ARCH=""
           if [ "${{ github.event.inputs.target_arch }}" == "aarch64" ]; then
             KERNEL_ARCH="arm64"
@@ -84,7 +87,6 @@ jobs:
           KERNEL_DIR="$(pwd)/android-kernel"
           KERNEL_OUT=""
 
-          # 2. 【不限深度】全局搜索 kernel_* 头文件目录
           if [ "${{ fromJSON(github.event.inputs.android_version) }}" -ge 14 ]; then
             KERNEL_OUT=$(find "$KERNEL_DIR/out" -type d -name "kernel_${{ github.event.inputs.target_arch }}*" 2>/dev/null | head -n1)
           else
@@ -101,11 +103,9 @@ jobs:
           echo "Kernel Out:    $KERNEL_OUT"
           echo "Kernel Arch:   $KERNEL_ARCH"
 
-          # 3. 准备驱动编译目录
           mkdir -p driver-build
           cp ./code/* driver-build/
 
-          # 4. 生成临时 Makefile
           KO_NAME="${{ github.event.inputs.driver_name }}"
           MOD_NAME="${KO_NAME%.ko}"
 
@@ -113,16 +113,15 @@ jobs:
           obj-m += ${MOD_NAME}.o
 
           all:
-          \t\$(MAKE) -C ${KERNEL_DIR} O=${KERNEL_OUT} ARCH=${KERNEL_ARCH} M=\$(CURDIR) modules
+          	\$(MAKE) -C ${KERNEL_DIR} O=${KERNEL_OUT} ARCH=${KERNEL_ARCH} M=\$(CURDIR) modules
 
           clean:
-          \t\$(MAKE) -C ${KERNEL_DIR} O=${KERNEL_OUT} ARCH=${KERNEL_ARCH} M=\$(CURDIR) clean
+          	\$(MAKE) -C ${KERNEL_DIR} O=${KERNEL_OUT} ARCH=${KERNEL_ARCH} M=\$(CURDIR) clean
           EOF
 
           echo "=== Generated Makefile ==="
           cat driver-build/Makefile
 
-          # 5. 执行编译
           make -C driver-build -j$(nproc)
 
       - name: Upload .ko Artifact
