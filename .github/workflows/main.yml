@@ -21,12 +21,14 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # 【关键修改】锁定使用 22.04 系统，该系统默认可用空间大，且不包含导致磁盘爆满的 24.04 新版系统缓存
+    runs-on: ubuntu-22.04
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extreme Disk Space Optimization
+      - name: Maximize Build Space (Fix Disk Space)
         uses: easimon/maximize-build-space@master
         with:
           root-reserve-mb: 1024          # 系统盘仅预留 1GB，强制释放所有剩余空间
@@ -38,10 +40,19 @@ jobs:
           remove-docker-images: 'true'   # 清除所有 Docker 镜像
           swap-reclaim-mb: 8192          # 重新调整 Swap 大小
 
+      # 【优化】精简安装命令，防止在 apt-get update 期间爆盘
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python3-pip curl
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            flex \
+            bison \
+            libssl-dev \
+            libelf-dev \
+            bc \
+            python3-pip \
+            curl
 
       - name: Install Google repo tool
         run: |
