@@ -1,117 +1,148 @@
-name: Android Kernel 612
+name: Kernel Module Builder (Refactored)
 
 on:
   workflow_dispatch:
     inputs:
-      android_version:
-        description: 'Android Version (Kernel) (e.g., 16)'
+      driver_name:
+        description: "Driver Module Name (e.g., uid_priv.ko)"
         required: true
-        default: '16'
-      kernel_version:
-        description: 'Kernel Version (e.g., 6.12)'
-        required: true
-        default: '6.12'
+        default: "uid_priv.ko"
       target_arch:
-        description: 'Target Architecture (aarch64, x86_64, etc.)'
+        description: "Target Architecture"
         required: true
-        default: 'aarch64'
-      mirror:
-        description: 'Mirror source (tuna/ustc/google)'
-        required: true
-        default: 'tuna'
+        default: "aarch64"
+        options:
+          - aarch64
+          - x86_64
 
 jobs:
-  build:
-    runs-on: self-hosted
-    
+  build-driver:
+    runs-on: ubuntu-24.04
+
     steps:
+      # 1. 检出代码
       - name: Checkout repository
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v4
 
-      - name: Check disk space
-        run: df -h
+      # 2. 极度精简磁盘空间（Android Kernel 编译极吃空间）
+      - name: Free up disk space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 12000
+          swap-size-mb: 8096
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
 
-      - name: Install dependencies
+      # 3. 安装编译必备依赖
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3 git-core gnupg curl zlib1g-dev libncurses5 unzip rsync
+          sudo apt-get install -y \
+            build-essential \
+            flex \
+            bison \
+            libssl-dev \
+            libelf-dev \
+            bc \
+            curl \
+            git
 
-      - name: Install repo tool
+      # 4. 安装 Google repo 工具
+      - name: Install repo
         run: |
-          if ! command -v repo &> /dev/null; then
-            sudo curl -L https://mirrors.tuna.tsinghua.edu.cn/git/git-repo -o /usr/local/bin/repo
-            sudo chmod a+x /usr/local/bin/repo
-          fi
-          git config --global user.email "builder@github.com"
-          git config --global user.name "Kernel Builder"
-          git config --global color.ui false
+          curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          chmod a+x /usr/local/bin/repo
 
-      - name: Set mirror URL
-        id: mirror
+      # 5. 克隆 Android GKI Kernel 源码 (Android 14 Kernel 6.1)
+      - name: Fetch Android GKI Kernel Source
         run: |
-          case "${{ github.event.inputs.mirror }}" in
-            tuna)
-              echo "MANIFEST_URL=https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/manifest" >> $GITHUB_ENV
-              echo "REPO_URL=https://mirrors.tuna.tsinghua.edu.cn/git/AOSP" >> $GITHUB_ENV
-              ;;
-            ustc)
-              echo "MANIFEST_URL=https://mirrors.ustc.edu.cn/aosp/kernel/manifest" >> $GITHUB_ENV
-              echo "REPO_URL=https://mirrors.ustc.edu.cn/aosp" >> $GITHUB_ENV
-              ;;
-            google)
-              echo "MANIFEST_URL=https://android.googlesource.com/kernel/manifest" >> $GITHUB_ENV
-              echo "REPO_URL=https://android.googlesource.com" >> $GITHUB_ENV
-              ;;
-          esac
+          mkdir -p /tmp/android_kernel
+          cd /tmp/android_kernel
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-android14-6.1 --depth=1
+          repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
 
-      - name: Set up Android Kernel source
+      # 6. 准备内核构建环境
+      - name: Prepare kernel build environment
         run: |
-          mkdir -p android-kernel && cd android-kernel
-          
-          # 使用镜像初始化
-          repo init -u ${{ env.MANIFEST_URL }} -b common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }} --depth=1
-          
-          # 替换 manifest 中的 URL 为镜像
-          if [ "${{ github.event.inputs.mirror }}" != "google" ]; then
-            sed -i 's|https://android.googlesource.com|${{ env.REPO_URL }}|g' .repo/manifests/default.xml
-          fi
-          
-          repo sync -c --no-tags --optimized-fetch --force-sync --no-clone-bundle -j$(nproc)
-          
-      - name: Check disk after sync
-        run: |
-          df -h
-          du -sh android-kernel/
-
-      - name: Increase stack frame size limit
-        run: |
-          cd android-kernel
-          if [ -f common/Makefile ]; then
-            find . -type f -name "Makefile*" -exec sed -i 's/-Wframe-larger-than=[0-9]*/-Wframe-larger-than=4096/g' {} +
-            grep -q "FRAME_WARN" common/Makefile || echo 'KBUILD_CFLAGS += -Wframe-larger-than=4096' >> common/Makefile
-          fi
-
-      - name: Build kernel
-        run: |
-          cd android-kernel
-          if [ ${{ github.event.inputs.android_version }} -le 13 ]; then
-            BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} LTO=thin build/build.sh -j$(nproc)
-            OUTPUT_PATH="out/android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}/dist"
+          cd /tmp/android_kernel
+          if [ "${{ inputs.target_arch }}" == "aarch64" ]; then
+            ARCH="arm64"
           else
-            echo "Using Bazel build system for Android ${{ github.event.inputs.android_version }}"
-            tools/bazel run //common:kernel_${{ github.event.inputs.target_arch }}_dist
-            OUTPUT_PATH="out/kernel_${{ github.event.inputs.target_arch }}"
+            ARCH="x86"
           fi
-          echo "OUTPUT_PATH=$OUTPUT_PATH" >> $GITHUB_ENV
 
-      - name: Upload kernel artifacts
-        uses: actions/upload-artifact@v4.6.2
-        with:
-          name: android-kernel-${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}-${{ github.event.inputs.target_arch }}
-          path: |
-            android-kernel/${{ env.OUTPUT_PATH }}
+          # 使用 Bazel 编译并生成 headers
+          tools/bazel build //common:kernel_${{ inputs.target_arch }}_headers
 
-      - name: Cleanup workspace
-        if: always()
+      # 7. 提取内核头文件路径 (重构了寻找路径的逻辑)
+      - name: Locate kernel headers path
         run: |
-          rm -rf android-kernel
+          # 尝试多种可能存在的输出目录命名规则
+          KERNEL_DIR="/tmp/android_kernel"
+          
+          if [ "${{ inputs.target_arch }}" == "aarch64" ]; then
+            HEADER_DIR=$(ls -d "${KERNEL_DIR}/out/"*/kernel_aarch64_headers 2>/dev/null | head -n 1)
+          else
+            HEADER_DIR=$(ls -d "${KERNEL_DIR}/out/"*/kernel_x86_headers 2>/dev/null | head -n 1)
+          fi
+
+          if [ -z "$HEADER_DIR" ]; then
+            echo "::error::Failed to locate kernel headers directory."
+            echo "Please check if the kernel build was successful."
+            exit 1
+          fi
+
+          # 将路径写入环境变量，供下一步使用
+          echo "KERNEL_DIR=$KERNEL_DIR" >> $GITHUB_ENV
+          echo "KERNEL_OUT=$HEADER_DIR" >> $GITHUB_ENV
+
+          echo "Kernel headers located at: $HEADER_DIR"
+
+      # 8. 外部模块编译 (Out-of-Tree Build)
+      - name: Compile driver module
+        run: |
+          if [ "${{ inputs.target_arch }}" == "aarch64" ]; then
+            ARCH="arm64"
+          else
+            ARCH="x86"
+          fi
+
+          KO_FILE="${{ inputs.driver_name }}"
+          OBJ_M=${KO_FILE%.ko}.o
+
+          mkdir -p /tmp/driver_build
+          cp -r ./code/* /tmp/driver_build/
+
+          # 动态生成标准的 Kbuild Makefile
+          cat > /tmp/driver_build/Makefile <<EOF
+obj-m := ${OBJ_M}
+
+all:
+	\$(MAKE) -C \${KERNEL_DIR} M=\${PWD} O=\${KERNEL_OUT} ARCH=${ARCH} modules
+
+clean:
+	\$(MAKE) -C \${KERNEL_DIR} M=\${PWD} O=\${KERNEL_OUT} ARCH=${ARCH} clean
+EOF
+
+          cd /tmp/driver_build
+          
+          # 开始编译
+          make KERNEL_DIR="${KERNEL_DIR}" KERNEL_OUT="${KERNEL_OUT}" -j$(nproc)
+
+          if [ ! -f "$KO_FILE" ]; then
+            echo "::error::Compilation failed. $KO_FILE was not generated."
+            exit 1
+          fi
+
+          echo "$KO_FILE generated successfully!"
+
+      # 9. 上传产物
+      - name: Upload compiled .ko artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.driver_name }}
+          path: /tmp/driver_build/${{ inputs.driver_name }}
+          if-no-files-found: error
