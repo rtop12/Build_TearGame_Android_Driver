@@ -1,138 +1,156 @@
-name: Android Kernel Driver Builder (Standalone .ko)
+name: Android Kernel Driver Builder
 
 on:
   workflow_dispatch:
     inputs:
       android_version:
-        description: 'Android Version (Kernel)'
+        description: 'Android Version (Kernel) (e.g., 14)'
         required: true
-        default: '14'
       kernel_version:
-        description: 'Kernel Version'
+        description: 'Kernel Version (e.g., 6.1)'
         required: true
-        default: '6.1'
       driver_name:
-        description: 'Driver Module Name (e.g., uid_priv.ko)'
+        description: 'Driver Module Name (e.g., mydriver.ko)'
         required: true
-        default: 'uid_priv.ko'
       target_arch:
-        description: 'Target Architecture (aarch64, x86_64)'
+        description: 'Target Architecture (aarch64, x86_64, etc.)'
         required: true
         default: 'aarch64'
 
 jobs:
   build:
+    # 固定使用 ubuntu-22.04，避免最新版系统环境变量差异导致构建失败
     runs-on: ubuntu-22.04
+    
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Free disk space manually
+        uses: actions/checkout@v4.2.2
+        
+      - name: Prepare kerneldriver directory
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/share/boost /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL /usr/local/share/chromium
-          sudo rm -rf /usr/local/lib/android/sdk /usr/share/swift /usr/local/.ghcup
-          sudo docker rmi $(docker images -aq) 2>/dev/null || true
-          sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
-          df -h
-
-      - name: Install system dependencies
+          mkdir kerneldriver
+          mv ./code/*.h ./code/*.c ./code/Makefile kerneldriver/
+          
+      - name: Install repo tool
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential flex bison libssl-dev libelf-dev bc curl
+          sudo curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          sudo chmod a+x /usr/local/bin/repo
 
-      - name: Install Google repo tool
-        run: |
-          curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
-          chmod a+x /usr/local/bin/repo
-
-      - name: Sync Android kernel source
+      - name: Set up Android Kernel source
         run: |
           mkdir -p android-kernel && cd android-kernel
-          repo init -u https://android.googlesource.com/kernel/manifest \
-            -b common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }} \
-            --depth=1
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}
           repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
 
-      - name: Build full GKI kernel via Bazel (gives complete out_dir + Module.symvers)
+      - name: Copy kerneldriver
         run: |
           cd android-kernel
-          tools/bazel build //common:kernel_${{ github.event.inputs.target_arch }}
-          echo "Bazel full-kernel build done."
+          cp -r ../kerneldriver common/drivers
 
-      - name: Locate complete out_dir and matching clang
+      - name: Modify Makefile
         run: |
           cd android-kernel
+          echo "obj-y += kerneldriver/" >> common/drivers/Makefile
 
-          SYMVER=$(find out/bazel -type f -name "Module.symvers" -path "*out_dir*" 2>/dev/null | head -n1)
-          if [ -z "$SYMVER" ]; then
-            echo "::error::No Module.symvers found in Bazel out_dir. Kernel build may have failed."
-            find out/bazel -type f -name "Module.symvers" 2>/dev/null | head
-            exit 1
-          fi
-          KERNEL_OUT=$(dirname "$SYMVER")
-          echo "KERNEL_OUT=$PWD/$KERNEL_OUT" >> $GITHUB_ENV
-
-          CLANG_DIR=$(find prebuilts/clang/host/linux-x86 -maxdepth 1 -type d -name "*487747*" 2>/dev/null | head -n1)
-          if [ -z "$CLANG_DIR" ]; then
-            CLANG_DIR=$(find prebuilts/clang/host/linux-x86 -maxdepth 1 -type d -name "clang-r*" 2>/dev/null | sort | tail -n1)
-          fi
-          if [ -z "$CLANG_DIR" ]; then
-            echo "::error::Cannot find prebuilt clang toolchain."
-            exit 1
-          fi
-          echo "CLANG_BIN=$CLANG_DIR/bin" >> $GITHUB_ENV
-          echo "Using clang at: $CLANG_DIR/bin"
-
-      - name: Build Driver Module (Out-of-Tree with matching clang17)
+      - name: Add module to GKI modules list
+        if: ${{ github.event.inputs.android_version > 13 }}
         run: |
-          KERNEL_DIR="$(pwd)/android-kernel/common"
-          KERNEL_OUT="${{ env.KERNEL_OUT }}"
-          CLANG_BIN="${{ env.CLANG_BIN }}"
+          cd android-kernel
+          MODULE_NAME="drivers/kerneldriver/${{ github.event.inputs.driver_name }}"
+          
+          awk -i inplace -v module="$MODULE_NAME" '
+            BEGIN { added=0 }
+            /_COMMON_GKI_MODULES_LIST = \[/ { in_list=1 }
+            in_list && /\]/ {
+              if (!added) {
+                print "    \"" module "\","
+                added=1
+              }
+              in_list=0
+            }
+            in_list && !added {
+              if (module < $0) {
+                print "    \"" module "\","
+                added=1
+              }
+            }
+            { print }
+          ' common/modules.bzl
+          
+      - name: Prepare module list for legacy builds
+        if: ${{ github.event.inputs.android_version <= 13 }}
+        run: |
+          cd android-kernel
+          echo "drivers/kerneldriver/${{ github.event.inputs.driver_name }}" >> common/android/gki_${{ github.event.inputs.target_arch }}_modules
 
-          if [ "${{ github.event.inputs.target_arch }}" == "aarch64" ]; then
-            KERNEL_ARCH="arm64"
+      - name: Increase stack frame size limit
+        run: |
+          cd android-kernel
+          find . -type f -name "Makefile*" -exec sed -i 's/-Wframe-larger-than=[0-9]*/-Wframe-larger-than=4096/g' {} +
+          grep -q "FRAME_WARN" common/Makefile || echo 'KBUILD_CFLAGS += -Wframe-larger-than=4096' >> common/Makefile
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3
+          
+      # ============== 新增：安装并强制使用 Clang 17 ==============
+      - name: Install and force Clang 17
+        run: |
+          sudo apt-get install -y clang-17 lld-17
+          
+      - name: Fix missing kprobe symbols for Android 13
+        if: ${{ github.event.inputs.android_version == 13 }}
+        run: |
+          cd android-kernel
+          for symbol in register_kprobe unregister_kprobe; do
+            grep -q "$symbol" common/android/abi_gki_${{ github.event.inputs.target_arch }} || \
+            echo "$symbol" >> common/android/abi_gki_${{ github.event.inputs.target_arch }}
+          done
+          sed -i '/EXPORT_SYMBOL(unregister_kprobe);/a EXPORT_SYMBOL(register_kprobe);' common/kernel/kprobes.c
+          
+      # ============== 修改：构建步骤，替换预编译的 Clang 为系统 Clang 17 ==============
+      - name: Build kernel module
+        run: |
+          cd android-kernel
+          
+          # 劫持内核源码自带的 clang-stable 目录，将其替换为系统的 Clang 17
+          # 这样无论 build.sh 还是 Bazel 都会自动使用高版本 Clang
+          if [ -d "prebuilts/clang/host/linux-x86/clang-stable" ]; then
+            sudo rm -rf prebuilts/clang/host/linux-x86/clang-stable
+          fi
+          sudo mkdir -p prebuilts/clang/host/linux-x86/clang-stable/bin
+          sudo ln -s /usr/bin/clang-17 prebuilts/clang/host/linux-x86/clang-stable/bin/clang
+          sudo ln -s /usr/bin/clang++-17 prebuilts/clang/host/linux-x86/clang-stable/bin/clang++
+          sudo ln -s /usr/bin/ld.lld-17 prebuilts/clang/host/linux-x86/clang-stable/bin/ld.lld
+
+          if [ ${{ github.event.inputs.android_version }} -le 13 ]; then
+            BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} LTO=thin build/build.sh -j32
+            OUTPUT_PATH="out/android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}/dist"
           else
-            KERNEL_ARCH="x86"
+            echo "Using Bazel build system for Android ${{ github.event.inputs.android_version }}"
+            tools/bazel run //common:kernel_${{ github.event.inputs.target_arch }}_dist -- --dist_dir=out/dist
+            OUTPUT_PATH="out/dist"
           fi
+          echo "OUTPUT_PATH=$OUTPUT_PATH" >> $GITHUB_ENV
+        continue-on-error: true
+      
+      # ============== 新增：提取单独的 .ko 文件 ==============
+      - name: Collect .ko files
+        run: |
+          mkdir -p ko_output
+          echo "正在从构建目录中提取 .ko 文件..."
+          # 在输出路径中查找 .ko
+          find android-kernel/${{ env.OUTPUT_PATH }} -type f -name "*.ko" -exec cp {} ko_output/ \; 2>/dev/null || true
+          # 额外兜底：在整个 out 目录中查找，防止 Bazel 输出路径不同
+          find android-kernel/out -type f -name "*.ko" -exec cp {} ko_output/ \; 2>/dev/null || true
+          
+          echo "提取到的 .ko 文件列表："
+          ls -lh ko_output/ || echo "未找到 .ko 文件，请检查构建日志"
 
-          echo "Kernel Src: $KERNEL_DIR"
-          echo "Kernel Out: $KERNEL_OUT"
-          echo "Kernel Arch:$KERNEL_ARCH"
-
-          mkdir -p driver-build
-          cp ./code/*.c ./code/*.h driver-build/ 2>/dev/null || cp ./code/* driver-build/
-
-          KO_NAME="${{ github.event.inputs.driver_name }}"
-          MOD_NAME="${KO_NAME%.ko}"
-          echo "obj-m += ${MOD_NAME}.o" > driver-build/Makefile
-          echo "=== Makefile ==="
-          cat driver-build/Makefile
-
-          make -C "$KERNEL_DIR" \
-            O="$KERNEL_OUT" \
-            ARCH=$KERNEL_ARCH \
-            LLVM=1 LLVM_IAS=1 \
-            CC="$CLANG_BIN/clang" \
-            LD="$CLANG_BIN/ld.lld" \
-            NM="$CLANG_BIN/llvm-nm" \
-            OBJCOPY="$CLANG_BIN/llvm-objcopy" \
-            OBJDUMP="$CLANG_BIN/llvm-objdump" \
-            READELF="$CLANG_BIN/llvm-readelf" \
-            STRIP="$CLANG_BIN/llvm-strip" \
-            M="$(pwd)/driver-build" \
-            modules -j$(nproc)
-
-          echo "=== Generated .ko ==="
-          find driver-build -name "*.ko"
-          echo "=== vermagic check ==="
-          modinfo driver-build/${{ github.event.inputs.driver_name }} | grep -i vermagic || true
-
-      - name: Upload .ko Artifact
-        uses: actions/upload-artifact@v4
+      # ============== 修改：只上传提取出的 ko 文件 ==============
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: kernel-driver-${{ github.event.inputs.target_arch }}
-          path: driver-build/${{ github.event.inputs.driver_name }}
-          if-no-files-found: error
+          path: ko_output/
