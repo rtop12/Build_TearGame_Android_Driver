@@ -28,13 +28,22 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
           sudo apt-get install -y \
             git-core gnupg flex bison build-essential \
             zip curl zlib1g-dev gcc-multilib g++-multilib \
-            libc6-dev-i386 lib32ncurses5-dev x11proto-core-dev \
-            libx11-dev lib32z1-dev libgl1-mesa-dev \
-            libxml2-utils xsltproc unzip fontconfig \
+            libc6-dev-i386 lib32ncurses-dev \
+            x11proto-core-dev libx11-dev lib32z1-dev \
+            libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
             python3 python3-pip gawk
+
+      - name: Fix ncurses compatibility
+        run: |
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libncurses.so.6 /usr/lib/x86_64-linux-gnu/libncurses.so.5
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5
+          sudo ln -sf /usr/lib32/libncurses.so.6 /usr/lib32/libncurses.so.5
+          sudo ln -sf /usr/lib32/libtinfo.so.6 /usr/lib32/libtinfo.so.5
 
       - name: Setup repo
         run: |
