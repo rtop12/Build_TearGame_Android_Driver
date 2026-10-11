@@ -1,133 +1,112 @@
-name: Android Kernel Driver Builder
+name: Android Kernel Driver Builder (Standalone .ko)
 
 on:
   workflow_dispatch:
     inputs:
       android_version:
-        description: 'Android Version (Kernel) (e.g., 14)'
+        description: "Android Version (e.g., 14)"
         required: true
       kernel_version:
-        description: 'Kernel Version (e.g., 6.1)'
+        description: "Kernel Version (e.g., 6.1)"
         required: true
       driver_name:
-        description: 'Driver Module Name (e.g., mydriver.ko)'
+        description: "Driver Module Name (e.g., mydriver.ko)"
         required: true
       target_arch:
-        description: 'Target Architecture (aarch64, x86_64, etc.)'
+        description: "Target Architecture (aarch64, x86_64)"
         required: true
-        default: 'aarch64'
+        default: "aarch64"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v4
 
-      # [新增] 内核构建极吃磁盘，先扩容，否则会 No space left on device
       - name: Free disk space
         uses: easimon/maximize-build-space@master
         with:
           root-reserve-mb: 8192
           swap-size-mb: 4096
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
-          remove-docker-images: 'true'
-
-      - name: Prepare kerneldriver directory
-        run: |
-          mkdir kerneldriver
-          mv ./code/*.h ./code/*.c ./code/Makefile kerneldriver/
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3
+          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python3-pip
 
-      - name: Install repo tool
+      - name: Download Android Kernel Sources
         run: |
-          sudo curl -L https://storage.googleapis.com/git-repo-内部工具s/repo -o /usr/local/bin/repo
-          sudo chmod a+x /usr/local/bin/repo
-
-      - name: Set up Android Kernel source
-        run: |
+          sudo pip3 install repo
           mkdir -p android-kernel && cd android-kernel
           repo init -u https://android.googlesource.com/kernel/manifest \
-            -b common-android${{ inputs.android_version }}-${{ inputs.kernel_version }} \
+            -b common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }} \
             --depth=1
           repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
 
-      - name: Copy kerneldriver into tree
+      - name: Prepare kernel build tree (Generate Headers)
         run: |
           cd android-kernel
-          # 拷贝后真实路径为 common/drivers/kerneldriver/
-          cp -r ../kerneldriver common/drivers/
-
-      - name: Modify Makefile (in-tree uses obj-y)
-        run: |
-          cd android-kernel
-          # 子目录 Makefile 若写的是 obj-m，转为 obj-y（in-tree 必须）
-          sed -i 's/^obj-m/obj-y/' common/drivers/kerneldriver/Makefile
-          echo "obj-y += kerneldriver/" >> common/drivers/Makefile
-
-      - name: Add module to GKI modules list
-        if: ${{ fromJSON(inputs.android_version) > 13 }}
-        run: |
-          cd android-kernel
-          MODULE="drivers/kerneldriver/${{ inputs.driver_name }}"
-          # 幂等：不存在才插入
-          grep -q "\"$MODULE\"" common/modules.bzl || \
-            sed -i "/_COMMON_GKI_MODULES_LIST = \[/a\\    \"$MODULE\"," common/modules.bzl
-
-      - name: Prepare module list for legacy builds
-        if: ${{ fromJSON(inputs.android_version) <= 13 }}
-        run: |
-          cd android-kernel
-          echo "drivers/kerneldriver/${{ inputs.driver_name }}" >> \
-            common/android/gki_${{ inputs.target_arch }}_modules
-
-      - name: Increase stack frame size limit
-        run: |
-          cd android-kernel
-          find . -type f -name "Makefile*" -exec sed -i 's/-Wframe-larger-than=[0-9]*/-Wframe-larger-than=4096/g' {} +
-          grep -q "Wframe-larger-than" common/Makefile || echo 'KBUILD_CFLAGS += -Wframe-larger-than=4096' >> common/Makefile
-
-      - name: Fix missing kprobe symbols for Android 13
-        if: ${{ fromJSON(inputs.android_version) == 13 }}
-        run: |
-          cd android-kernel
-          for symbol in register_kprobe unregister_kprobe; do
-            grep -q "$symbol" common/android/abi_gki_${{ inputs.target_arch }} || \
-              echo "$symbol" >> common/android/abi_gki_${{ inputs.target_arch }}
-          done
-          sed -i '/EXPORT_SYMBOL(unregister_kprobe);/a EXPORT_SYMBOL(register_kprobe);' common/kernel/kprobes.c
-
-      - name: Build kernel module
-        run: |
-          cd android-kernel
-          if [ ${{ fromJSON(inputs.android_version) }} -le 13 ]; then
-            BUILD_CONFIG=common/build.config.gki.${{ inputs.target_arch }} LTO=thin build/build.sh -j32
+          if [ "${{ fromJSON(github.event.inputs.android_version) }}" -ge 14 ]; then
+            # Android 14+ 使用 Bazel 准备内核头文件
+            tools/bazel build //common:kernel_${{ github.event.inputs.target_arch }}_headers
           else
-            echo "Using Bazel build system for Android ${{ inputs.android_version }}"
-            tools/bazel run //common:kernel_${{ inputs.target_arch }}_dist
+            # Android 13 及以下使用 build.sh prepare
+            BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} \
+              build/build.sh prepare
           fi
 
-      # [新增] 定位产物：Bazel/legacy 都把 .ko 放进 out 下的 dist 目录
-      - name: Locate driver artifact
+      - name: Build Driver Module (Out-of-Tree)
         run: |
-          KO_PATH=$(find android-kernel/out -type f -name "${{ inputs.driver_name }}" | head -n1)
-          if [ -z "$KO_PATH" ]; then
-            echo "${{ inputs.driver_name }} not found in out/*/dist"; exit 1
-          fi
-          echo "Found $KO_PATH"
-          echo "KO_PATH=$KO_PATH" >> "$GITHUB_ENV"
+          # 1. 映射架构名称 (aarch64 -> arm64, x86_64 -> x86)
+          ARCH_MAP_aarch64="arm64"
+          ARCH_MAP_x86_64="x86"
+          KERNEL_ARCH="${ARCH_MAP_${{ github.event.inputs.target_arch }}:-${{ github.event.inputs.target_arch }}}"
 
-      # [新增] 精确上传单个 .ko，避免像上次那样把整个 out 目录打成十几 GB
-      - name: Upload artifacts
+          # 2. 动态定位内核输出目录 (Headers 所在路径)
+          if [ "${{ fromJSON(github.event.inputs.android_version) }}" -ge 14 ]; then
+            KERNEL_OUT="$(find ./android-kernel/out -maxdepth 3 -type d -name 'kernel_*_headers' | head -n1)"
+          else
+            KERNEL_OUT="$(find ./android-kernel/out -maxdepth 3 -type d -name 'android*' | head -n1)"
+          fi
+
+          # 3. 创建临时构建目录
+          mkdir -p driver-build
+          cp ./code/* driver-build/
+
+          # 4. 写入外部模块编译的 Makefile
+          cat > driver-build/Makefile <<'MAKE'
+          ifeq ($(KERNEL_DIR),)
+          $(error KERNEL_DIR is not set)
+          endif
+          ifeq ($(KERNEL_OUT),)
+          $(error KERNEL_OUT is not set)
+          endif
+          ifeq ($(DRIVER_NAME),)
+          $(error DRIVER_NAME is not set)
+          endif
+
+          obj-m += $(DRIVER_NAME:.ko=.o)
+
+          all:
+              $(MAKE) -C $(KERNEL_DIR) O=$(KERNEL_OUT) ARCH=$(KERNEL_ARCH) M=$(CURDIR) modules
+          MAKE
+
+          # 5. 执行编译
+          make -C driver-build \
+            KERNEL_DIR="$(pwd)/android-kernel" \
+            KERNEL_OUT="$KERNEL_OUT" \
+            KERNEL_ARCH="$KERNEL_ARCH" \
+            DRIVER_NAME="${{ github.event.inputs.driver_name }}" \
+            -j$(nproc)
+
+      - name: Upload .ko Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-driver-${{ inputs.target_arch }}
-          path: ${{ env.KO_PATH }}
+          name: kernel-driver-${{ github.event.inputs.target_arch }}
+          path: driver-build/${{ github.event.inputs.driver_name }}
