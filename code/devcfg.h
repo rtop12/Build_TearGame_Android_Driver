@@ -1,27 +1,17 @@
-/* SPDX-License-Identifier: GPL-2.0 */
-#ifndef __DEVCFG_H__
-#define __DEVCFG_H__
+#ifndef _DEVCFG_H
+#define _DEVCFG_H
 
-#include <linux/ioctl.h>
-#include <linux/types.h>
+#include <linux/version.h>
 
-#define DEVCFG_MAGIC 'D'
+#define DEVCFG_NODE     "devcfg"
+#define DEVCFG_TRIGGER  "Menu"
+#define DEVCFG_TRIGGER_LEN 4
+#define DEVCFG_BUF_SIZE 16
 
-#define DEVCFG_IOCTL_GET_VERSION   _IOR(DEVCFG_MAGIC, 0x01, struct devcfg_info)
-#define DEVCFG_IOCTL_READ_CONFIG   _IOWR(DEVCFG_MAGIC, 0x02, struct devcfg_data)
+ssize_t devcfg_write(struct file *file, const char __user *ubuf,
+                     size_t cnt, loff_t *ppos);
 
-#define DEVCFG_NAME_MAX   64
-#define DEVCFG_DATA_MAX   256
-
-struct devcfg_info {
-    __u32 version;
-    char  name[DEVCFG_NAME_MAX];
-};
-
-struct devcfg_data {
-    __u32 key;
-    __u32 size;
-    char  buf[DEVCFG_DATA_MAX];
-};
+int  devcfg_init(void);
+void devcfg_exit(void);
 
 #endif
