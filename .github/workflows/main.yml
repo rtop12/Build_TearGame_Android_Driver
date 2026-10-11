@@ -21,38 +21,27 @@ on:
 
 jobs:
   build:
-    # 【关键修改】锁定使用 22.04 系统，该系统默认可用空间大，且不包含导致磁盘爆满的 24.04 新版系统缓存
     runs-on: ubuntu-22.04
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Maximize Build Space (Fix Disk Space)
+      - name: Maximize Build Space
         uses: easimon/maximize-build-space@master
         with:
-          root-reserve-mb: 1024          # 系统盘仅预留 1GB，强制释放所有剩余空间
-          swap-size-mb: 8192             # 增加 8GB 虚拟内存
-          remove-dotnet: 'true'          # 卸载 .NET
-          remove-android: 'true'         # 卸载无用 Android SDK
-          remove-haskell: 'true'         # 卸载 Haskell
-          remove-codeql: 'true'          # 卸载 CodeQL
-          remove-docker-images: 'true'   # 清除所有 Docker 镜像
-          swap-reclaim-mb: 8192          # 重新调整 Swap 大小
+          root-reserve-mb: 1024
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+          swap-reclaim-mb: 8192
 
-      # 【优化】精简安装命令，防止在 apt-get update 期间爆盘
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            flex \
-            bison \
-            libssl-dev \
-            libelf-dev \
-            bc \
-            python3-pip \
-            curl
+          sudo apt-get install -y --no-install-recommends build-essential flex bison libssl-dev libelf-dev bc python3-pip curl
 
       - name: Install Google repo tool
         run: |
@@ -82,7 +71,7 @@ jobs:
 
       - name: Build Driver Module (Out-of-Tree)
         run: |
-          # 1. 映射架构名称 (aarch64 -> arm64, x86_64 -> x86)
+          # 1. 映射架构名称
           KERNEL_ARCH=""
           if [ "${{ github.event.inputs.target_arch }}" == "aarch64" ]; then
             KERNEL_ARCH="arm64"
@@ -92,18 +81,20 @@ jobs:
             KERNEL_ARCH="${{ github.event.inputs.target_arch }}"
           fi
 
-          # 2. 动态定位内核输出目录 (包含 Headers 的路径)
           KERNEL_DIR="$(pwd)/android-kernel"
           KERNEL_OUT=""
-          
+
+          # 2. 【关键修复】先列出 out 下所有目录，排查路径；再精确匹配
           if [ "${{ fromJSON(github.event.inputs.android_version) }}" -ge 14 ]; then
-            KERNEL_OUT=$(find "$KERNEL_DIR/out" -maxdepth 3 -type d -name "kernel_*_headers" | head -n1)
+            echo "Listing all dirs under out:"
+            find "$KERNEL_DIR/out" -maxdepth 2 -type d
+            KERNEL_OUT=$(find "$KERNEL_DIR/out" -maxdepth 2 -type d -name "kernel_${{ github.event.inputs.target_arch }}*" | head -n1)
           else
-            KERNEL_OUT=$(find "$KERNEL_DIR/out" -maxdepth 3 -type d -name "android*" | head -n1)
+            KERNEL_OUT=$(find "$KERNEL_DIR/out" -maxdepth 2 -type d -name "android*" | head -n1)
           fi
 
           if [ -z "$KERNEL_OUT" ]; then
-            echo "::error::Cannot find kernel output directory (headers)."
+            echo "::error::Cannot find kernel output directory (headers). Please check the listing above."
             exit 1
           fi
 
@@ -111,35 +102,30 @@ jobs:
           echo "Kernel Out:    $KERNEL_OUT"
           echo "Kernel Arch:   $KERNEL_ARCH"
 
-          # 3. 准备驱动编译目录
+          # 3. 准备驱动编译目录（只拷贝 .c .h，不要拷贝你自己的 Makefile）
           mkdir -p driver-build
-          cp ./code/* driver-build/
+          cp ./code/*.c ./code/*.h driver-build/
 
-          # 4. 写入外部模块编译的 Makefile
-          cat > driver-build/Makefile <<'EOF'
-          ifeq ($(KERNEL_DIR),)
-          $(error KERNEL_DIR is not set)
-          endif
-          ifeq ($(KERNEL_OUT),)
-          $(error KERNEL_OUT is not set)
-          endif
-          ifeq ($(DRIVER_NAME),)
-          $(error DRIVER_NAME is not set)
-          endif
+          # 4. 生成临时 Makefile（obj-m 用模块名去掉 .ko 后缀）
+          KO_NAME="${{ github.event.inputs.driver_name }}"
+          MOD_NAME="${KO_NAME%.ko}"
 
-          obj-m += $(DRIVER_NAME:.ko=.o)
+          cat > driver-build/Makefile <<EOF
+          obj-m += ${MOD_NAME}.o
 
           all:
-          	$(MAKE) -C $(KERNEL_DIR) O=$(KERNEL_OUT) ARCH=$(KERNEL_ARCH) M=$(CURDIR) modules
+          \t\$(MAKE) -C ${KERNEL_DIR} O=${KERNEL_OUT} ARCH=${KERNEL_ARCH} M=\$(CURDIR) modules
+
+          clean:
+          \t\$(MAKE) -C ${KERNEL_DIR} O=${KERNEL_OUT} ARCH=${KERNEL_ARCH} M=\$(CURDIR) clean
           EOF
 
+          echo "=== Generated Makefile ==="
+          cat driver-build/Makefile
+          echo "=========================="
+
           # 5. 执行编译
-          make -C driver-build \
-            KERNEL_DIR="$KERNEL_DIR" \
-            KERNEL_OUT="$KERNEL_OUT" \
-            KERNEL_ARCH="$KERNEL_ARCH" \
-            DRIVER_NAME="${{ github.event.inputs.driver_name }}" \
-            -j$(nproc)
+          make -C driver-build -j$(nproc)
 
       - name: Upload .ko Artifact
         uses: actions/upload-artifact@v4
