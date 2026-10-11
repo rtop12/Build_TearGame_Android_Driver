@@ -4,18 +4,20 @@ on:
   workflow_dispatch:
     inputs:
       android_version:
-        description: "Android Version (e.g., 14)"
+        description: 'Android Version (Kernel) (e.g., 14)'
         required: true
+        default: '14'
       kernel_version:
-        description: "Kernel Version (e.g., 6.1)"
+        description: 'Kernel Version (e.g., 6.1)'
         required: true
+        default: '6.1'
       driver_name:
-        description: "Driver Module Name (e.g., mydriver.ko)"
+        description: 'Driver Module Name (e.g., mydriver.ko)'
         required: true
       target_arch:
-        description: "Target Architecture (aarch64, x86_64)"
+        description: 'Target Architecture (aarch64, x86_64)'
         required: true
-        default: "aarch64"
+        default: 'aarch64'
 
 jobs:
   build:
@@ -29,21 +31,26 @@ jobs:
         with:
           root-reserve-mb: 8192
           swap-size-mb: 4096
-          remove-dotnet: "true"
-          remove-android: "true"
-          remove-haskell: "true"
-          remove-codeql: "true"
-          remove-docker-images: "true"
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
 
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python3-pip
+          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python3-pip curl
 
-      - name: Download Android Kernel Sources
+      - name: Install Google repo tool
         run: |
-          sudo pip3 install repo
-          mkdir -p android-kernel && cd android-kernel
+          curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          chmod a+x /usr/local/bin/repo
+
+      - name: Sync Android kernel source
+        run: |
+          mkdir -p android-kernel
+          cd android-kernel
           repo init -u https://android.googlesource.com/kernel/manifest \
             -b common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }} \
             --depth=1
@@ -53,34 +60,53 @@ jobs:
         run: |
           cd android-kernel
           if [ "${{ fromJSON(github.event.inputs.android_version) }}" -ge 14 ]; then
-            # Android 14+ 使用 Bazel 准备内核头文件
+            # Android 14+ 使用 Bazel 编译内核头文件
+            echo "Building headers with Bazel..."
             tools/bazel build //common:kernel_${{ github.event.inputs.target_arch }}_headers
           else
-            # Android 13 及以下使用 build.sh prepare
+            # Android 13 及以下使用 prepare
+            echo "Preparing build tree with build.sh..."
             BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} \
-              build/build.sh prepare
+            build/build.sh prepare
           fi
 
       - name: Build Driver Module (Out-of-Tree)
         run: |
           # 1. 映射架构名称 (aarch64 -> arm64, x86_64 -> x86)
-          ARCH_MAP_aarch64="arm64"
-          ARCH_MAP_x86_64="x86"
-          KERNEL_ARCH="${ARCH_MAP_${{ github.event.inputs.target_arch }}:-${{ github.event.inputs.target_arch }}}"
-
-          # 2. 动态定位内核输出目录 (Headers 所在路径)
-          if [ "${{ fromJSON(github.event.inputs.android_version) }}" -ge 14 ]; then
-            KERNEL_OUT="$(find ./android-kernel/out -maxdepth 3 -type d -name 'kernel_*_headers' | head -n1)"
+          KERNEL_ARCH=""
+          if [ "${{ github.event.inputs.target_arch }}" == "aarch64" ]; then
+            KERNEL_ARCH="arm64"
+          elif [ "${{ github.event.inputs.target_arch }}" == "x86_64" ]; then
+            KERNEL_ARCH="x86"
           else
-            KERNEL_OUT="$(find ./android-kernel/out -maxdepth 3 -type d -name 'android*' | head -n1)"
+            KERNEL_ARCH="${{ github.event.inputs.target_arch }}"
           fi
 
-          # 3. 创建临时构建目录
+          # 2. 动态定位内核输出目录 (包含 Headers 的路径)
+          KERNEL_DIR="$(pwd)/android-kernel"
+          KERNEL_OUT=""
+          
+          if [ "${{ fromJSON(github.event.inputs.android_version) }}" -ge 14 ]; then
+            KERNEL_OUT=$(find "$KERNEL_DIR/out" -maxdepth 3 -type d -name "kernel_*_headers" | head -n1)
+          else
+            KERNEL_OUT=$(find "$KERNEL_DIR/out" -maxdepth 3 -type d -name "android*" | head -n1)
+          fi
+
+          if [ -z "$KERNEL_OUT" ]; then
+            echo "::error::Cannot find kernel output directory (headers)."
+            exit 1
+          fi
+
+          echo "Kernel Source: $KERNEL_DIR"
+          echo "Kernel Out:    $KERNEL_OUT"
+          echo "Kernel Arch:   $KERNEL_ARCH"
+
+          # 3. 准备驱动编译目录
           mkdir -p driver-build
           cp ./code/* driver-build/
 
           # 4. 写入外部模块编译的 Makefile
-          cat > driver-build/Makefile <<'MAKE'
+          cat > driver-build/Makefile <<'EOF'
           ifeq ($(KERNEL_DIR),)
           $(error KERNEL_DIR is not set)
           endif
@@ -94,12 +120,12 @@ jobs:
           obj-m += $(DRIVER_NAME:.ko=.o)
 
           all:
-              $(MAKE) -C $(KERNEL_DIR) O=$(KERNEL_OUT) ARCH=$(KERNEL_ARCH) M=$(CURDIR) modules
-          MAKE
+          	$(MAKE) -C $(KERNEL_DIR) O=$(KERNEL_OUT) ARCH=$(KERNEL_ARCH) M=$(CURDIR) modules
+          EOF
 
           # 5. 执行编译
           make -C driver-build \
-            KERNEL_DIR="$(pwd)/android-kernel" \
+            KERNEL_DIR="$KERNEL_DIR" \
             KERNEL_OUT="$KERNEL_OUT" \
             KERNEL_ARCH="$KERNEL_ARCH" \
             DRIVER_NAME="${{ github.event.inputs.driver_name }}" \
@@ -110,3 +136,4 @@ jobs:
         with:
           name: kernel-driver-${{ github.event.inputs.target_arch }}
           path: driver-build/${{ github.event.inputs.driver_name }}
+          if-no-files-found: error
