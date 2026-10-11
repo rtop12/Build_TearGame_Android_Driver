@@ -45,7 +45,7 @@ jobs:
 
       - name: Install Google repo tool
         run: |
-          curl -L https://storage.googleapis.com/git-repo-内部工具s/repo -o /usr/local/bin/repo
+          curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
           chmod a+x /usr/local/bin/repo
 
       - name: Sync Android kernel source
@@ -66,7 +66,6 @@ jobs:
         run: |
           cd android-kernel
 
-          # 1. 真正可外编的 out_dir = 含 Module.symvers 的目录
           SYMVER=$(find out/bazel -type f -name "Module.symvers" -path "*out_dir*" 2>/dev/null | head -n1)
           if [ -z "$SYMVER" ]; then
             echo "::error::No Module.symvers found in Bazel out_dir. Kernel build may have failed."
@@ -76,7 +75,6 @@ jobs:
           KERNEL_OUT=$(dirname "$SYMVER")
           echo "KERNEL_OUT=$PWD/$KERNEL_OUT" >> $GITHUB_ENV
 
-          # 2. 锁定与内核同版本(r487747c)的 clang，避免回退到系统 clang14
           CLANG_DIR=$(find prebuilts/clang/host/linux-x86 -maxdepth 1 -type d -name "*487747*" 2>/dev/null | head -n1)
           if [ -z "$CLANG_DIR" ]; then
             CLANG_DIR=$(find prebuilts/clang/host/linux-x86 -maxdepth 1 -type d -name "clang-r*" 2>/dev/null | sort | tail -n1)
@@ -107,14 +105,12 @@ jobs:
           mkdir -p driver-build
           cp ./code/*.c ./code/*.h driver-build/ 2>/dev/null || cp ./code/* driver-build/
 
-          # 模块 Makefile 只声明 obj-m，交叉参数全部走命令行，杜绝版本错配
           KO_NAME="${{ github.event.inputs.driver_name }}"
           MOD_NAME="${KO_NAME%.ko}"
           echo "obj-m += ${MOD_NAME}.o" > driver-build/Makefile
           echo "=== Makefile ==="
           cat driver-build/Makefile
 
-          # 【关键】显式强制 CC/LD 用 prebuilts clang17 + LLVM 全套，绝不落到 Ubuntu clang14
           make -C "$KERNEL_DIR" \
             O="$KERNEL_OUT" \
             ARCH=$KERNEL_ARCH \
