@@ -4,23 +4,25 @@ on:
   workflow_dispatch:
     inputs:
       android_version:
-        description: "Android Version (Kernel) (e.g., 14)"
+        description: "Android Version (e.g., 14)"
         required: true
+        default: "14"
       kernel_version:
         description: "Kernel Version (e.g., 6.1)"
         required: true
+        default: "6.1"
       driver_name:
-        description: "Driver Module Name (e.g., devcfg.ko)"
+        description: "Driver Name (e.g., uid_priv.ko)"
         required: true
+        default: "uid_priv.ko"
       target_arch:
-        description: "Target Architecture (aarch64, x86_64)"
+        description: "Target Architecture"
         required: true
         default: "aarch64"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -36,30 +38,10 @@ jobs:
           remove-codeql: "true"
           remove-docker-images: "true"
 
-      - name: Validate driver sources
-        run: |
-          shopt -s nullglob
-
-          files=(./code/*.c ./code/*.h ./code/Makefile)
-
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "No driver sources or Makefile found in ./code/"
-            exit 1
-          fi
-
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            flex \
-            bison \
-            libssl-dev \
-            libelf-dev \
-            bc \
-            python-is-python3 \
-            curl \
-            git
+          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python3 curl git
 
       - name: Install repo tool
         run: |
@@ -70,92 +52,53 @@ jobs:
         run: |
           mkdir -p android-kernel
           cd android-kernel
-
-          repo init \
-            -u https://android.googlesource.com/kernel/manifest \
-            -b common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }} \
-            --depth=1
-
+          repo init -u https://android.googlesource.com/kernel/manifest \
+            -b common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }} --depth=1
           repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
 
       - name: Prepare kernel build tree
         run: |
           cd android-kernel
-
-          if [ "${{ fromJSON(github.event.inputs.android_version) }}" -ge 14 ]; then
+          if [ "${{ github.event.inputs.android_version }}" -ge 14 ]; then
             tools/bazel build //common:kernel_${{ github.event.inputs.target_arch }}_headers
           else
-            BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} \
-              LTO=thin \
-              build/build.sh prepare
+            BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} LTO=thin build/build.sh prepare
           fi
 
-      - name: Prepare out-of-tree driver build
+      - name: Build driver module (uid_priv.ko)
         run: |
-          DRIVER_NAME="${{ github.event.inputs.driver_name }}"
-          KO_BASE="${DRIVER_NAME%.ko}"
-          ARCH_MAP_aarch64="arm64"
-          ARCH_MAP_x86_64="x86"
-          KERNEL_ARCH="${ARCH_MAP_${{ github.event.inputs.target_arch }}:-${{ github.event.inputs.target_arch }}}"
+          # 统一锁定为 uid_priv，防止本地测试与CI混淆
+          DRIVER_NAME="uid_priv.ko"
+          KO_BASE="uid_priv"
+          KERNEL_ARCH="arm64"
 
           KERNEL_DIR="$(pwd)/android-kernel"
-
-          if [ "${{ fromJSON(github.event.inputs.android_version) }}" -ge 14 ]; then
-            KERNEL_OUT="$(find "$KERNEL_DIR/out" -maxdepth 3 -type d -name 'kernel_*_headers' | head -n1)"
-          else
-            KERNEL_OUT="$(find "$KERNEL_DIR/out" -maxdepth 3 -type d -name 'android*' | head -n1)"
-          fi
+          # 使用通配符精准匹配内核输出目录
+          KERNEL_OUT=$(ls -d "${KERNEL_DIR}/out"/*/kernel_aarch64_headers 2>/dev/null | head -n1)
 
           if [ -z "$KERNEL_OUT" ]; then
-            echo "Kernel build/output directory not found"
+            echo "Error: Kernel headers directory not found! Available directories:"
+            ls -l "${KERNEL_DIR}/out/"
             exit 1
           fi
 
-          mkdir -p driver-build
+          echo "Found kernel headers at: $KERNEL_OUT"
 
+          mkdir -p driver-build
           cp ./code/* driver-build/
 
-          cat > driver-build/Makefile <<'MAKE'
-          ifeq ($(KERNEL_DIR),)
-          $(error KERNEL_DIR is not set)
-          endif
+          cat > driver-build/Makefile <<'EOF'
+obj-m := uid_priv.o
 
-          ifeq ($(KERNEL_OUT),)
-          $(error KERNEL_OUT is not set)
-          endif
+all:
+	$(MAKE) -C $(KERNEL_DIR) O=$(KERNEL_OUT) ARCH=$(KERNEL_ARCH) M=$(CURDIR) modules
+EOF
 
-          ifeq ($(DRIVER_NAME),)
-          $(error DRIVER_NAME is not set)
-          endif
-
-          obj-m := $(DRIVER_NAME:.ko=.o)
-
-          all:
-          	$(MAKE) -C $(KERNEL_DIR) O=$(KERNEL_OUT) ARCH=$(KERNEL_ARCH) M=$(CURDIR) modules
-
-          clean:
-          	$(MAKE) -C $(KERNEL_DIR) O=$(KERNEL_OUT) ARCH=$(KERNEL_ARCH) M=$(CURDIR) clean
-          MAKE
-
-          echo "KERNEL_DIR=$KERNEL_DIR" >> "$GITHUB_ENV"
-          echo "KERNEL_OUT=$KERNEL_OUT" >> "$GITHUB_ENV"
-          echo "KERNEL_ARCH=$KERNEL_ARCH" >> "$GITHUB_ENV"
-          echo "KO_BASE=$KO_BASE" >> "$GITHUB_ENV"
-
-      - name: Build driver module
-        run: |
           cd driver-build
+          make KERNEL_DIR="$KERNEL_DIR" KERNEL_OUT="$KERNEL_OUT" KERNEL_ARCH="$KERNEL_ARCH" -j$(nproc)
 
-          make \
-            KERNEL_DIR="$KERNEL_DIR" \
-            KERNEL_OUT="$KERNEL_OUT" \
-            KERNEL_ARCH="$KERNEL_ARCH" \
-            DRIVER_NAME="${{ github.event.inputs.driver_name }}" \
-            -j$(nproc)
-
-          if [ ! -f "${{ github.event.inputs.driver_name }}" ]; then
-            echo "Build completed but ${{ github.event.inputs.driver_name }} was not generated"
-            find . -type f -name "*.ko" || true
+          if [ ! -f "$DRIVER_NAME" ]; then
+            echo "Build failed: $DRIVER_NAME not generated!"
             exit 1
           fi
 
@@ -163,4 +106,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: kernel-driver-${{ github.event.inputs.target_arch }}
-          path: driver-build/${{ github.event.inputs.driver_name }}
+          path: driver-build/uid_priv.ko
