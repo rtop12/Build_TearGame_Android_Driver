@@ -84,17 +84,16 @@ jobs:
           KERNEL_DIR="$(pwd)/android-kernel"
           KERNEL_OUT=""
 
-          # 2. 【关键修复】先列出 out 下所有目录，排查路径；再精确匹配
+          # 2. 【不限深度】全局搜索 kernel_* 头文件目录
           if [ "${{ fromJSON(github.event.inputs.android_version) }}" -ge 14 ]; then
-            echo "Listing all dirs under out:"
-            find "$KERNEL_DIR/out" -maxdepth 2 -type d
-            KERNEL_OUT=$(find "$KERNEL_DIR/out" -maxdepth 2 -type d -name "kernel_${{ github.event.inputs.target_arch }}*" | head -n1)
+            KERNEL_OUT=$(find "$KERNEL_DIR/out" -type d -name "kernel_${{ github.event.inputs.target_arch }}*" 2>/dev/null | head -n1)
           else
-            KERNEL_OUT=$(find "$KERNEL_DIR/out" -maxdepth 2 -type d -name "android*" | head -n1)
+            KERNEL_OUT=$(find "$KERNEL_DIR/out" -type d -name "android*" 2>/dev/null | head -n1)
           fi
 
           if [ -z "$KERNEL_OUT" ]; then
-            echo "::error::Cannot find kernel output directory (headers). Please check the listing above."
+            echo "::error::Cannot find kernel headers output directory."
+            find "$KERNEL_DIR/out" -type d 2>/dev/null | head -20
             exit 1
           fi
 
@@ -102,11 +101,11 @@ jobs:
           echo "Kernel Out:    $KERNEL_OUT"
           echo "Kernel Arch:   $KERNEL_ARCH"
 
-          # 3. 准备驱动编译目录（只拷贝 .c .h，不要拷贝你自己的 Makefile）
+          # 3. 准备驱动编译目录
           mkdir -p driver-build
-          cp ./code/*.c ./code/*.h driver-build/
+          cp ./code/* driver-build/
 
-          # 4. 生成临时 Makefile（obj-m 用模块名去掉 .ko 后缀）
+          # 4. 生成临时 Makefile
           KO_NAME="${{ github.event.inputs.driver_name }}"
           MOD_NAME="${KO_NAME%.ko}"
 
@@ -122,7 +121,6 @@ jobs:
 
           echo "=== Generated Makefile ==="
           cat driver-build/Makefile
-          echo "=========================="
 
           # 5. 执行编译
           make -C driver-build -j$(nproc)
