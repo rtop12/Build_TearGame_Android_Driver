@@ -26,16 +26,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Free disk space
+      - name: Extreme Disk Space Optimization
         uses: easimon/maximize-build-space@master
         with:
-          root-reserve-mb: 8192
-          swap-size-mb: 4096
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
-          remove-docker-images: 'true'
+          root-reserve-mb: 1024          # 系统盘仅预留 1GB，强制释放所有剩余空间
+          swap-size-mb: 8192             # 增加 8GB 虚拟内存
+          remove-dotnet: 'true'          # 卸载 .NET
+          remove-android: 'true'         # 卸载无用 Android SDK
+          remove-haskell: 'true'         # 卸载 Haskell
+          remove-codeql: 'true'          # 卸载 CodeQL
+          remove-docker-images: 'true'   # 清除所有 Docker 镜像
+          swap-reclaim-mb: 8192          # 重新调整 Swap 大小
 
       - name: Install system dependencies
         run: |
@@ -60,11 +61,9 @@ jobs:
         run: |
           cd android-kernel
           if [ "${{ fromJSON(github.event.inputs.android_version) }}" -ge 14 ]; then
-            # Android 14+ 使用 Bazel 编译内核头文件
             echo "Building headers with Bazel..."
             tools/bazel build //common:kernel_${{ github.event.inputs.target_arch }}_headers
           else
-            # Android 13 及以下使用 prepare
             echo "Preparing build tree with build.sh..."
             BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} \
             build/build.sh prepare
