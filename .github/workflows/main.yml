@@ -56,70 +56,97 @@ jobs:
             --depth=1
           repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
 
-      - name: Build Driver Module (Traditional Make + Clang)
+      - name: Generate headers via Bazel (official way for android14-6.1)
         run: |
-          KERNEL_DIR="$(pwd)/android-kernel"
-          KO_NAME="${{ github.event.inputs.driver_name }}"
-          MOD_NAME="${KO_NAME%.ko}"
+          cd android-kernel
+          echo "Building headers with Bazel..."
+          tools/bazel build //common:kernel_${{ github.event.inputs.target_arch }}_headers
+          echo "Bazel build done. Searching for .config and headers..."
 
-          # 1. 动态查找 Clang 工具链路径
-          CLANG_DIR=$(find "$KERNEL_DIR/prebuilts/clang/host/linux-x86" -maxdepth 1 -type d -name "clang-*" 2>/dev/null | head -n1)
-          if [ -z "$CLANG_DIR" ]; then
-            echo "::error::Cannot find Clang toolchain in prebuilts directory."
-            ls -la "$KERNEL_DIR/prebuilts/clang/host/linux-x86/" 2>/dev/null || echo "prebuilts dir not found"
+          # 全局搜索 .config 文件
+          CONFIG_FILE=$(find "$(pwd)/out" -name ".config" -type f 2>/dev/null | head -n1)
+          if [ -z "$CONFIG_FILE" ]; then
+            echo "::error::Cannot find .config in Bazel output."
+            find "$(pwd)/out" -maxdepth 4 -type f -name "*.config" 2>/dev/null | head -5
             exit 1
           fi
-          echo "Found Clang at: $CLANG_DIR"
-          export PATH="$CLANG_DIR/bin:$PATH"
+          echo "Found .config at: $CONFIG_FILE"
 
-          # 2. 映射架构
+          # .config 所在的目录就是内核构建输出目录
+          KERNEL_OUT_DIR=$(dirname "$CONFIG_FILE")
+          echo "Kernel output directory: $KERNEL_OUT_DIR"
+
+          # 验证头文件是否存在
+          if [ ! -f "$KERNEL_OUT_DIR/include/generated/autoconf.h" ] && \
+             [ ! -f "$KERNEL_OUT_DIR/include/config/auto.conf" ]; then
+            echo "::warning::autoconf.h not found in expected location, but .config exists."
+          fi
+
+          echo "KERNEL_OUT_DIR=$KERNEL_OUT_DIR" >> $GITHUB_ENV
+
+      - name: Build Driver Module (Out-of-Tree via make)
+        run: |
+          KERNEL_DIR="$(pwd)/android-kernel/common"
+          KERNEL_OUT="${{ env.KERNEL_OUT_DIR }}"
+
+          if [ -z "$KERNEL_OUT" ] || [ ! -d "$KERNEL_OUT" ]; then
+            echo "::error::KERNEL_OUT not set or not a directory."
+            exit 1
+          fi
+
+          # 映射架构
           if [ "${{ github.event.inputs.target_arch }}" == "aarch64" ]; then
             KERNEL_ARCH="arm64"
           else
             KERNEL_ARCH="x86"
           fi
 
-          echo "Using ARCH=$KERNEL_ARCH, LLVM=1, LLVM_IAS=1"
+          echo "Kernel Source: $KERNEL_DIR"
+          echo "Kernel Out:    $KERNEL_OUT"
+          echo "Kernel Arch:   $KERNEL_ARCH"
 
-          # 3. 进入内核源码目录
-          cd "$KERNEL_DIR/common"
-
-          # 4. 生成内核配置
-          echo "=== Generating defconfig ==="
-          make LLVM=1 LLVM_IAS=1 ARCH=${KERNEL_ARCH} gki_defconfig
-
-          # 5. 准备构建环境（编译 scripts、生成 autoconf.h 等）
-          echo "=== Preparing build environment ==="
-          make LLVM=1 LLVM_IAS=1 ARCH=${KERNEL_ARCH} prepare modules_prepare
-
-          # 6. 准备驱动源码目录
-          cd "$KERNEL_DIR"
+          # 准备驱动编译目录
           mkdir -p driver-build
           cp ./code/*.c ./code/*.h driver-build/ 2>/dev/null || cp ./code/* driver-build/
+
+          # 生成 Makefile
+          KO_NAME="${{ github.event.inputs.driver_name }}"
+          MOD_NAME="${KO_NAME%.ko}"
 
           cat > driver-build/Makefile <<EOF
           obj-m += ${MOD_NAME}.o
 
           all:
-          	\$(MAKE) LLVM=1 LLVM_IAS=1 ARCH=${KERNEL_ARCH} M=\$(CURDIR) modules
+          	\$(MAKE) -C ${KERNEL_DIR} O=${KERNEL_OUT} ARCH=${KERNEL_ARCH} M=\$(CURDIR) modules
 
           clean:
-          	\$(MAKE) LLVM=1 LLVM_IAS=1 ARCH=${KERNEL_ARCH} M=\$(CURDIR) clean
+          	\$(MAKE) -C ${KERNEL_DIR} O=${KERNEL_OUT} ARCH=${KERNEL_ARCH} M=\$(CURDIR) clean
           EOF
 
           echo "=== Makefile ==="
           cat driver-build/Makefile
 
-          # 7. 编译外部模块（-C 指向内核源码，M= 指向模块目录）
+          # 查找 Clang 工具链并加入 PATH
+          CLANG_DIR=$(find "$(pwd)/android-kernel/prebuilts/clang/host/linux-x86" -maxdepth 1 -type d -name "clang-*" 2>/dev/null | head -n1)
+          if [ -n "$CLANG_DIR" ]; then
+            export PATH="$CLANG_DIR/bin:$PATH"
+            echo "Using Clang from: $CLANG_DIR/bin"
+            CLANG_FLAG="LLVM=1 LLVM_IAS=1"
+          else
+            echo "Clang not found, using GCC"
+            CLANG_FLAG=""
+          fi
+
+          # 编译模块
           echo "=== Building module ==="
-          make -C "$KERNEL_DIR/common" LLVM=1 LLVM_IAS=1 ARCH=${KERNEL_ARCH} M="$KERNEL_DIR/driver-build" modules
+          make -C driver-build -j$(nproc) ${CLANG_FLAG}
 
           echo "=== Generated .ko files ==="
-          find "$KERNEL_DIR/driver-build" -name "*.ko"
+          find driver-build -name "*.ko"
 
       - name: Upload .ko Artifact
         uses: actions/upload-artifact@v4
         with:
           name: kernel-driver-${{ github.event.inputs.target_arch }}
-          path: android-kernel/driver-build/${{ github.event.inputs.driver_name }}
+          path: driver-build/${{ github.event.inputs.driver_name }}
           if-no-files-found: error
