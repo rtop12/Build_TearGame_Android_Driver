@@ -1,15 +1,6 @@
-load("//common:build/kernel/defs.bzl", "kernel_module")
+load("//build/kernel/kleaf:gki.bzl", "gki_module")
 
-package(default_visibility = ["//visibility:public"])
-
-kernel_module(
+gki_module(
     name = "devcfg",
-    srcs = [
-        "devcfg.c",
-    ],
-    hdrs = [
-        "devcfg.h",
-    ],
-    kernel_build = "//common:kernel_aarch64",
-    module_name = "devcfg",
+    srcs = glob(["*.c", "*.h"]),
 )
