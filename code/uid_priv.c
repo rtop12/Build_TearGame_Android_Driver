@@ -35,15 +35,20 @@ static ssize_t uid_priv_write(struct file *file,
     rcu_read_lock();
 
     for_each_process(task) {
-        if (uid_eq(task_uid(task), target_uid)) {
-            const struct cred *old;
+        // 在 RCU 锁内直接访问 task->cred 是安全的
+        // 替换掉已废弃的 task_uid(task)
+        if (uid_eq(task->cred->uid, target_uid)) {
             struct cred *new;
 
-            old = task_cred(task);
+            // 注意：这里 prepare_creds 是在为 current（当前调用者）准备凭证
+            // 如果你希望提权当前调用者（例如通过 echo 命令触发），这样写是可以的
             new = prepare_creds();
             if (!new)
                 break;
 
+            // 在这里可以修改 new 的 uid，例如 new->uid = GLOBAL_ROOT_UID;
+            // 但默认 prepare_creds 只是复制了 current 的凭证，并没有变成 root
+            
             commit_creds(new);
             break;
         }
