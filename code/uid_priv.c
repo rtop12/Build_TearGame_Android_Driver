@@ -1,4 +1,3 @@
-#include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/kprobes.h>
@@ -9,9 +8,10 @@
 #include <linux/cred.h>
 #include <linux/uidgid.h>
 #include <linux/capability.h>
+#include <linux/prctl.h>
 #include "uid_priv.h"
 
-/* ================= 白名单管理（对应 KernelSU allowlist） ================= */
+/* ================= 白名单管理 ================= */
 
 struct uid_rule {
     uid_t uid;
@@ -70,7 +70,7 @@ static int uid_remove(uid_t uid)
     return -ENOENT;
 }
 
-/* ================= 核心：把当前进程提权为 root ================= */
+/* ================= 核心：提权函数 ================= */
 
 static void grant_root(void)
 {
@@ -112,20 +112,21 @@ static int prctl_pre(struct kprobe *p, struct pt_regs *regs)
     case MYROOT_CMD_ADD:
         uid_add((uid_t)arg);
         break;
-
     case MYROOT_CMD_REMOVE:
         uid_remove((uid_t)arg);
         break;
-
     case MYROOT_CMD_GRANT:
-        /* 关键：谁调用，谁被检查；在白名单里就提权 */
         if (uid_allowed(current_uid().val))
             grant_root();
         break;
-
     default:
         break;
     }
+
+    /* 【关键修复】处理完自定义命令后，把第一个参数伪装成标准命令
+     * 这样原本的 sys_prctl 就会继续执行并成功返回 0，不再报 EINVAL */
+    regs->regs[0] = PR_SET_NAME;
+
     return 0;
 }
 
@@ -146,6 +147,9 @@ static int execve_pre(struct kprobe *p, struct pt_regs *regs)
 int uid_priv_init(void)
 {
     int ret;
+
+    /* 【测试用】直接把你的 App UID 10337 写死进白名单，防止你找不到测试入口 */
+    uid_add(10337);
 
     kp_prctl.symbol_name = "__arm64_sys_prctl";
     kp_prctl.pre_handler = prctl_pre;
@@ -174,6 +178,8 @@ void uid_priv_exit(void)
     unregister_kprobe(&kp_prctl);
     pr_info("uid_priv: unloaded\n");
 }
+
+/* 加上这两行，消除 modpost 警告 */
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("skzvn");
+MODULE_AUTHOR("YourName");
 MODULE_DESCRIPTION("UID Root Module");
