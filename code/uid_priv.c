@@ -9,12 +9,10 @@
 #include <linux/uidgid.h>
 #include <linux/capability.h>
 #include <linux/prctl.h>
-#include <linux/kallsyms.h>
 #include <linux/string.h>
 #include "uid_priv.h"
 
 /* ================= 自定义 SELinux 结构体与符号 ================= */
-/* 因为内核头文件不导出内部结构体，我们手动定义（只取必要字段） */
 struct task_security_struct {
     u32 osid;           /* SID prior to last execve */
     u32 sid;            /* current SID */
@@ -25,7 +23,7 @@ struct task_security_struct {
 };
 
 /* 动态解析出来的函数指针 */
-static int (*my_security_secctx_to_secid)(const char *secdata, u32 seclen, u32 *secid);
+static u32 (*my_security_secctx_to_secid)(const char *secdata, u32 seclen, u32 *secid);
 
 #define KERNEL_SU_DOMAIN "u:r:su:s0"
 #define KERNEL_MAGISK_DOMAIN "u:r:magisk:s0"
@@ -87,18 +85,16 @@ static int switch_to_su_domain(void)
         return -EINVAL;
     }
 
-    /* 先尝试 su 域，如果不存在尝试 magisk 域，实在不行就进 kernel 域 */
+    /* 尝试 su 域，失败则尝试 magisk 域，再失败回退到 SID 1 */
     error = my_security_secctx_to_secid(KERNEL_SU_DOMAIN, strlen(KERNEL_SU_DOMAIN), &sid);
     if (error) {
         error = my_security_secctx_to_secid(KERNEL_MAGISK_DOMAIN, strlen(KERNEL_MAGISK_DOMAIN), &sid);
         if (error) {
-            /* 终极回退：SID 1 通常是 kernel 域，权限最大 */
             pr_warn("uid_priv: su/magisk domain not found, fallback to SID 1 (kernel)\n");
             sid = 1; 
         }
     }
 
-    /* 强制修改 SID 及相关安全上下文 */
     tsec->sid = sid;
     tsec->create_sid = 0;
     tsec->keycreate_sid = 0;
@@ -165,7 +161,6 @@ static int prctl_pre(struct kprobe *p, struct pt_regs *regs)
         break;
     }
 
-    /* 伪装参数，防止原生 prctl 返回 -1 干扰 App */
     regs->regs[0] = PR_SET_NAME;
     return 0;
 }
@@ -178,14 +173,20 @@ static struct kprobe kp_execveat;
 int uid_priv_init(void)
 {
     int ret;
+    struct kprobe kp_secctx;
 
-    /* 动态解析 security_secctx_to_secid 符号地址 */
-    my_security_secctx_to_secid = (void *)kallsyms_lookup_name("security_secctx_to_secid");
-    if (!my_security_secctx_to_secid) {
-        pr_err("uid_priv: 无法找到 security_secctx_to_secid，SELinux 切换将失败\n");
+    /* 【关键修复】用 kprobe 动态获取 security_secctx_to_secid 的地址 */
+    memset(&kp_secctx, 0, sizeof(kp_secctx));
+    kp_secctx.symbol_name = "security_secctx_to_secid";
+    if (register_kprobe(&kp_secctx) == 0) {
+        my_security_secctx_to_secid = (void *)kp_secctx.addr;
+        unregister_kprobe(&kp_secctx);
+        pr_info("uid_priv: found security_secctx_to_secid at %px\n", my_security_secctx_to_secid);
+    } else {
+        pr_err("uid_priv: failed to find security_secctx_to_secid\n");
     }
 
-    /* 【测试用】硬编码把你的 App UID 加入白名单，正式环境请删掉这行 */
+    /* 【测试用】硬编码把你的 App UID 加入白名单 */
     uid_add(10337); 
 
     // 1. 注册 prctl 钩子
@@ -200,7 +201,7 @@ int uid_priv_init(void)
     ret = register_kprobe(&kp_execve);
     if (ret) pr_err("uid_priv: register execve failed: %d\n", ret);
 
-    // 3. 注册 execveat 钩子（拦截 fork+execl 路径）
+    // 3. 注册 execveat 钩子
     kp_execveat.symbol_name = "__arm64_sys_execveat";
     kp_execveat.pre_handler = execve_pre;
     ret = register_kprobe(&kp_execveat);
